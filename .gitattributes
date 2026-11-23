@@ -1,0 +1,5 @@
+# Windows batch files must keep CRLF line endings; DAZ scripts are kept byte for byte.
+* text=auto
+*.cmd text eol=crlf
+*.dsa -text
+*.ico binary

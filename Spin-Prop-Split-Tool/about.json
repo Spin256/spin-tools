@@ -1,0 +1,9 @@
+{
+  "name": "Spin Prop Split Tool",
+  "description": "Select and split mesh parts, then return the separated objects to DAZ Studio.",
+  "dependencies": [
+    "numpy",
+    "qt",
+    "vtk"
+  ]
+}

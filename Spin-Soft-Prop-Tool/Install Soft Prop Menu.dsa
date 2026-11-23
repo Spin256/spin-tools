@@ -1,0 +1,67 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Register the scene-selection launcher in DAZ Studio's Scripts menu.
+(function () {
+    var title = "Install Spin Soft Prop Tool menu";
+    // Inside "Install Spin Tools Menu.dsa" the suite shows one summary instead.
+    var quiet = false;
+    try { quiet = new DzAppSettings("Spin256/Installer").getStringValue("Quiet", "") === "1"; } catch (e) {}
+    var folder = String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var path = folder + "Soft Prop Tool.dsa";
+    try {
+        if (!folder) throw new Error("Run the saved Install Soft Prop Menu.dsa file from the tool folder.");
+        if (!new DzFileInfo(path).exists()) {
+            throw new Error("Could not find " + path);
+        }
+        var description = "Select scene objects and open Spin Soft Prop Tool";
+        // Read the launcher on every click so future updates need no reinstall.
+        var launcher = "(function () {" +
+            "var file = new DzFile(" + JSON.stringify(path) + ");" +
+            "if (!file.open(DzFile.ReadOnly)) {" +
+            "MessageBox.warning('Cannot open the soft prop launcher script.', 'Spin Soft Prop Tool', 'OK', ''); return; }" +
+            "var code = file.read(); file.close();" +
+            "var script = new DzScript(); script.setCode('var spinSoftPropFolder = ' + " +
+            JSON.stringify(JSON.stringify(folder)) + " + ';\\n' + code);" +
+            "if (!script.execute()) {" +
+            "MessageBox.warning(script.errorMessage(), 'Spin Soft Prop Tool', 'OK', ''); }" +
+            "})();";
+        var manager = MainWindow.getActionMgr();
+        var action = "";
+        for (var i = 0; i < manager.getNumCustomActions(); i++) {
+            var file = String(manager.getCustomActionFile(i)).replace(/\\/g, "/");
+            if (file.toLowerCase() === path.toLowerCase() ||
+                    manager.getCustomActionDesc(i) === description) {
+                manager.setCustomActionScript(i, launcher, false);
+                manager.setCustomActionText(i, "Soft Prop Tool...");
+                if (typeof manager.setCustomActionDescription === "function") {
+                    manager.setCustomActionDescription(i, description);
+                }
+                action = manager.getCustomActionName(i);
+                break;
+            }
+        }
+        if (!action) {
+            action = manager.addCustomAction("Soft Prop Tool...", description, launcher, false, "", "");
+        }
+        if (!action) {
+            throw new Error("DAZ Studio could not register the soft prop launcher.");
+        }
+        var scriptsMenu = manager.getMenu().getSubMenu("&Scripts");
+        var menu = scriptsMenu.findOrCreateSubMenu("Spin Tools");
+        var items = menu.getItemList();
+        var installed = false;
+        for (var j = 0; j < items.length; j++) {
+            if (items[j].type == DzActionMenuItem.CustomAction && items[j].action == action) {
+                installed = true;
+                break;
+            }
+        }
+        if (!installed) menu.insertCustomAction(action, -1);
+        print("Spin Soft Prop Tool installed: Scripts > Spin Tools > Soft Prop Tool...");
+        if (!quiet) MessageBox.information("The launcher is ready under Scripts > Spin Tools > Soft Prop Tool.", title, "OK");
+    } catch (error) {
+        if (quiet) throw error;
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

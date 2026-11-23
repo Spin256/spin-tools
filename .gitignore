@@ -1,0 +1,25 @@
+# Installed by setup
+.venv/
+wheelhouse/
+*.whl
+.spin-install.lock
+.settings-install-*
+
+# Generated at run time
+temp/
+.warp-cache/
+__pycache__/
+*.py[cod]
+*.log
+*.dmp
+*.tmp
+
+# Saved presets
+*_presets.json
+
+# Editors and Windows
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

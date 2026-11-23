@@ -1,0 +1,192 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Shared receive window for Spin Tools results.
+// It routes each ready result to the owning tool's own receive script and never
+// reads, writes or imports mesh data itself. Each tool's import stays separate.
+//
+// Registry contract (DzAppSettings "Spin256/Receiver/<app>", key "Captures"):
+//   {version: 1, captures: [{tool, title, session, folder, receive_script,
+//     folder_variable, once_variable, settings, state_key, registered}]}
+// A tool replaces only its own entry. The tool's state (settings + state_key) is
+// JSON {session, received, nodes, receiveError}; its receive script, run with
+// once_variable = true, imports the revision named by "<session>.latest" and
+// records the receipt or receiveError there.
+(function () {
+    var title = "Spin Tools - Receive Results";
+    var appName = App.getApplicationDataName();
+    var registry = new DzAppSettings("Spin256/Receiver/" + appName);
+    var VERSION = 1;
+    var IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+    function readText(path) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.ReadOnly)) throw new Error("Could not read " + path);
+        try { return file.read().replace(/^﻿/, ""); }
+        finally { file.close(); }
+    }
+
+    function loadCaptures() {
+        var data;
+        try { data = JSON.parse(registry.getStringValue("Captures", "") || "{}"); }
+        catch (error) { return []; }
+        return data && data.version === VERSION && Array.isArray(data.captures) ? data.captures : [];
+    }
+
+    function saveCaptures(captures) {
+        if (!registry.setStringValue("Captures", JSON.stringify({ version: VERSION, captures: captures }))) {
+            throw new Error("DAZ could not save the Spin Tools receive list.");
+        }
+    }
+
+    function valid(entry) {
+        return entry && typeof entry.session === "string" && typeof entry.folder === "string" &&
+            typeof entry.receive_script === "string" && !/[\/\\]/.test(entry.receive_script) &&
+            IDENTIFIER.test(entry.folder_variable) && IDENTIFIER.test(entry.once_variable) &&
+            typeof entry.settings === "string" && typeof entry.state_key === "string";
+    }
+
+    function toolState(entry) {
+        try {
+            return JSON.parse(new DzAppSettings(entry.settings + appName).getStringValue(entry.state_key, "") || "{}");
+        } catch (error) {
+            return {};
+        }
+    }
+
+    function status(entry) {
+        if (!valid(entry) || !new DzFile(entry.session).exists()) return { state: "ended" };
+        var tool = toolState(entry);
+        if (tool.session !== entry.session) return { state: "ended" };
+        var latest = entry.session.replace(/\.json$/, ".latest");
+        var revision = "";
+        if (new DzFile(latest).exists()) revision = readText(latest).replace(/\\/g, "/");
+        if (!revision || revision === tool.received) return { state: tool.received ? "received" : "waiting" };
+        var error = tool.receiveError;
+        var message = error && (!error.revision || error.revision === revision) ? String(error.message) : "";
+        return { state: message ? "error" : "ready", revision: revision, error: message };
+    }
+
+    // Success is the tool's own receipt naming this revision. A tool may also
+    // remove a finished capture afterwards (Prop Split), which then reads as ended.
+    function receive(entry, revision) {
+        var script = new DzScript();
+        script.setCode("var " + entry.folder_variable + " = " + JSON.stringify(entry.folder) + ";\n" +
+            "var " + entry.once_variable + " = true;\n" + readText(entry.folder + entry.receive_script));
+        if (!script.execute()) throw new Error(script.errorMessage());
+        return !!revision && toolState(entry).received === revision;
+    }
+
+    function name(entry) {
+        return (entry.title || entry.tool || "Spin tool") + " (" +
+            String(entry.session).replace(/\\/g, "/").replace(/^.*\//, "") + ")";
+    }
+
+    function describe(entry, current) {
+        switch (current.state) {
+        case "waiting": return name(entry) + ": waiting for Send";
+        case "received": return name(entry) + ": received - Send again to replace it";
+        case "ready": return name(entry) + ": result ready";
+        case "error": return name(entry) + ": receive failed - " + current.error;
+        default: return name(entry) + ": capture ended";
+        }
+    }
+
+    // Prune ended captures, then receive every ready result, oldest first.
+    // Returns {lines, received, failed}.
+    function poll(retryFailed) {
+        var captures = loadCaptures();
+        var kept = [], lines = [], received = 0, failed = 0;
+        captures.sort(function (a, b) { return (a.registered || 0) - (b.registered || 0); });
+        for (var i = 0; i < captures.length; i++) {
+            var entry = captures[i];
+            var current;
+            try { current = status(entry); }
+            catch (error) { current = { state: "error", error: error.message }; }
+            if (current.state === "ended") continue;
+            kept.push(entry);
+            if (current.state === "ready" || (retryFailed && current.state === "error")) {
+                try {
+                    if (receive(entry, current.revision)) received++;
+                    current = status(entry);
+                } catch (error) {
+                    print(title + ": " + error.message);
+                    current = { state: "error", error: error.message };
+                }
+                if (current.state === "ended") {
+                    kept.pop();
+                    continue;
+                }
+            }
+            if (current.state === "error") failed++;
+            lines.push(describe(entry, current));
+        }
+        if (kept.length !== captures.length) saveCaptures(kept);
+        return { lines: lines, received: received, failed: failed };
+    }
+
+    try {
+        // A window that is already open picks up new captures on its next poll.
+        var heartbeat = Number(registry.getStringValue("Heartbeat", "0")) || 0;
+        if (Date.now() - heartbeat < 2000) return;
+
+        var first = poll(false);
+        if (!first.lines.length) {
+            MessageBox.information("No Spin Tools captures are waiting for a result.\n" +
+                "Start a tool from Scripts > Spin Tools.", title, "OK");
+            return;
+        }
+        if (first.received && !first.failed) return;
+
+        var dialog = new DzBasicDialog();
+        dialog.caption = title;
+        dialog.showHelpButton(false);
+        dialog.showAcceptButton(false);
+        dialog.setCancelButtonText("Close");
+        var help = new DzLabel(dialog);
+        help.textFormat = DzLabel.PlainText;
+        help.wordWrap = true;
+        help.text = "Leave this window open to receive results automatically when you click Send in a Spin tool.\n" +
+            "Close it to use DAZ; reopen Scripts > Spin Tools > Receive Spin Tools Results to receive later.";
+        dialog.addWidget(help);
+        var list = new DzLabel(dialog);
+        list.textFormat = DzLabel.PlainText;
+        list.wordWrap = true;
+        dialog.addWidget(list);
+        var retry = new DzPushButton(dialog);
+        retry.text = "Retry failed";
+        retry.autoDefault = false;
+        dialog.addWidget(retry);
+        var timer = new DzTimer(dialog);
+
+        function show(result) {
+            list.text = result.lines.length ? result.lines.join("\n") : "No captures remain.";
+            retry.enabled = result.failed > 0;
+            // Close after a successful receive so the result can be inspected in DAZ.
+            if (result.received && !result.failed) dialog.close();
+        }
+        function tick(retryFailed) {
+            timer.stop();
+            registry.setStringValue("Heartbeat", String(Date.now()));
+            try { show(poll(retryFailed)); }
+            catch (error) {
+                list.text = "Could not check for results.\n" + error.message;
+                print(title + ": " + error.message);
+            }
+            timer.start(500);
+        }
+        connect(timer, "timeout()", function () { tick(false); });
+        connect(retry, "clicked()", function () { tick(true); });
+        show(first);
+        registry.setStringValue("Heartbeat", String(Date.now()));
+        timer.start(500);
+        try { dialog.exec(); }
+        finally {
+            timer.stop();
+            registry.setStringValue("Heartbeat", "0");
+        }
+    } catch (error) {
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

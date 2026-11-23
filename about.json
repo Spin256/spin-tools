@@ -1,0 +1,78 @@
+{
+  "name": "Spin Tools",
+  "description": "Mesh tools for DAZ Studio and standalone workflows.",
+  "credits": [
+    {
+      "name": "Spin256",
+      "role": "Author"
+    }
+  ],
+  "links": [
+    {
+      "name": "Website",
+      "url": "https://www.spin256.com/tools"
+    },
+    {
+      "name": "Donate",
+      "url": "https://www.spin256.com/tools/donate"
+    }
+  ],
+  "dependencies": [],
+  "acknowledgments": {
+    "warp": {
+      "name": "NVIDIA Warp",
+      "author": "NVIDIA Corporation and contributors",
+      "license": "Apache-2.0",
+      "links": [
+        {
+          "name": "Project and license",
+          "url": "https://github.com/NVIDIA/warp/blob/main/LICENSE.md"
+        }
+      ]
+    },
+    "numpy": {
+      "name": "NumPy",
+      "author": "NumPy Developers",
+      "license": "BSD-3-Clause",
+      "links": [
+        {
+          "name": "Project and license",
+          "url": "https://numpy.org/"
+        }
+      ]
+    },
+    "qt": {
+      "name": "PySide6 / Qt for Python",
+      "author": "The Qt Company Ltd. and contributors",
+      "license": "LGPL-3.0 / GPL-3.0 / commercial terms",
+      "links": [
+        {
+          "name": "Project and license",
+          "url": "https://doc.qt.io/qtforpython-6/licenses.html"
+        }
+      ]
+    },
+    "vtk": {
+      "name": "VTK",
+      "author": "Kitware, Inc. and contributors",
+      "license": "BSD-3-Clause",
+      "links": [
+        {
+          "name": "Project and license",
+          "url": "https://vtk.org/about/"
+        }
+      ]
+    },
+    "ufbx": {
+      "name": "ufbx Python bindings",
+      "author": "Samuli Raivio",
+      "license": "MIT",
+      "links": [
+        {
+          "name": "Project and license",
+          "url": "https://github.com/bqqbarbhg/ufbx-python/blob/main/pyproject.toml"
+        }
+      ]
+    }
+  }
+}

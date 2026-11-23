@@ -1,0 +1,697 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Import a completed static or FBX animation result; preserve originals for undo/reposing.
+// Run through Receive Soft Body Result.dsa for each result sent from the helper.
+(function () {
+    var title = "Return Soft Body to DAZ";
+    var folder = typeof spinSoftBodyFolder === "string" ? spinSoftBodyFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var sessionPath = typeof drapeReturnSessionPath !== "undefined" ? drapeReturnSessionPath :
+        FileDialog.doFileDialog(true, title, folder, "Drape session (*.json)");
+    if (!sessionPath) {
+        return;
+    }
+    var created = [];
+    var visibilityEdits = [];
+    var importer = null;
+    var waterImporter = null;
+    var undoOpen = false;
+    var timeEditOpen = false;
+    var originalTime = Scene.getTime();
+    var originalSelection = Scene.getSelectedNodeList();
+    var originalPrimary = Scene.getPrimarySelection();
+
+    function readText(path) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.ReadOnly)) {
+            throw new Error("Could not read " + path);
+        }
+        try {
+            return file.read();
+        } finally {
+            file.close();
+        }
+    }
+
+    function normalPath(path) {
+        return String(path).replace(/\\/g, "/").toLowerCase();
+    }
+
+    function readObj(path) {
+        var vertices = [];
+        var uvs = [];
+        var polygons = [];
+        var material = "";
+        var lines = readText(path).split(/\r?\n/);
+        for (var i = 0; i < lines.length; i++) {
+            var text = lines[i].replace(/#.*/, "").replace(/^\s+|\s+$/g, "");
+            if (!text) {
+                continue;
+            }
+            var fields = text.split(/\s+/);
+            if (fields[0] === "v" || fields[0] === "vt") {
+                var count = fields[0] === "v" ? 3 : 2;
+                var point = [];
+                for (var axis = 0; axis < count; axis++) {
+                    var value = Number(fields[axis + 1]);
+                    if (!isFinite(value)) {
+                        throw new Error("A result contains invalid geometry coordinates.");
+                    }
+                    point.push(value);
+                }
+                if (count === 3) {
+                    vertices.push(point);
+                } else {
+                    uvs.push(point);
+                }
+            } else if (fields[0] === "usemtl") {
+                material = fields[1];
+            } else if (fields[0] === "f") {
+                var indices = [];
+                var uvIndices = [];
+                for (var corner = 1; corner < fields.length; corner++) {
+                    var parts = fields[corner].split("/");
+                    var index = Number(parts[0]) - 1;
+                    if (index < 0 || index >= vertices.length || Math.floor(index) !== index) {
+                        throw new Error("A result contains an invalid polygon index.");
+                    }
+                    indices.push(index);
+                    var uvIndex = parts[1] ? Number(parts[1]) - 1 : -1;
+                    if (uvIndex < -1 || uvIndex >= uvs.length || Math.floor(uvIndex) !== uvIndex) {
+                        throw new Error("A result contains an invalid UV index.");
+                    }
+                    uvIndices.push(uvIndex);
+                }
+                polygons.push({ vertices: indices, uvs: uvIndices, material: material });
+            }
+        }
+        return { vertices: vertices, uvs: uvs, polygons: polygons };
+    }
+
+    function facetIndices(facet) {
+        var indices = [facet.vertIdx1, facet.vertIdx2, facet.vertIdx3];
+        if (facet.vertIdx4 >= 0) {
+            indices.push(facet.vertIdx4);
+        }
+        return indices;
+    }
+
+    function polygonKey(vertices, material) {
+        return material + "|" + vertices.slice().sort(function (a, b) { return a - b; }).join(",");
+    }
+
+    function verifyGeometry(node, expected) {
+        node.getObject().forceCacheUpdate(node);
+        var mesh = node.getObject().getCachedGeom();
+        if (!mesh || !mesh.inherits("DzFacetMesh") ||
+                mesh.getNumVertices() !== expected.vertices.length ||
+                mesh.getNumFacets() !== expected.polygons.length) {
+            throw new Error("The returned mesh has an unexpected vertex or polygon count (" +
+                (mesh ? mesh.getNumVertices() + " vertices, " + mesh.getNumFacets() + " polygons" : "no evaluated mesh") + ").");
+        }
+        for (var v = 0; v < expected.vertices.length; v++) {
+            var point = mesh.getVertex(v);
+            var wanted = expected.vertices[v];
+            var difference = Math.max(Math.abs(point.x - wanted[0]), Math.abs(point.y - wanted[1]),
+                Math.abs(point.z - wanted[2]));
+            if (!isFinite(difference) || difference > 0.0001) {
+                throw new Error("The returned mesh changed vertex order, scale or world placement.");
+            }
+        }
+        var faces = Object.create(null);
+        for (var p = 0; p < expected.polygons.length; p++) {
+            var polygon = expected.polygons[p];
+            var key = polygonKey(polygon.vertices, polygon.material);
+            if (!faces[key]) {
+                faces[key] = [];
+            }
+            faces[key].push(polygon);
+        }
+        var uvMap = mesh.getUVs();
+        for (var f = 0; f < mesh.getNumFacets(); f++) {
+            var facet = mesh.getFacet(f);
+            var group = mesh.getMaterialGroup(facet.materialIndex);
+            var indices = facetIndices(facet);
+            var faceKey = polygonKey(indices, group ? group.name : "");
+            if (!faces[faceKey] || !faces[faceKey].length) {
+                throw new Error("The returned polygons or surface assignments changed during import.");
+            }
+            var reference = faces[faceKey].pop();
+            var uvIndices = [facet.uvwIdx1, facet.uvwIdx2, facet.uvwIdx3, facet.uvwIdx4];
+            for (var c = 0; c < indices.length; c++) {
+                var sourceCorner = reference.vertices.indexOf(indices[c]);
+                var sourceUV = reference.uvs[sourceCorner];
+                if (sourceUV >= 0) {
+                    if (!uvMap || uvIndices[c] < 0 || uvIndices[c] >= uvMap.getNumValues()) {
+                        throw new Error("A returned polygon lost its UV coordinates.");
+                    }
+                    var uv = uvMap.getPnt2Vec(uvIndices[c]);
+                    var uvDifference = Math.max(Math.abs(uv.x - expected.uvs[sourceUV][0]),
+                        Math.abs(uv.y - expected.uvs[sourceUV][1]));
+                    if (!isFinite(uvDifference) || uvDifference > 0.000001) {
+                        throw new Error("The returned garment's UV mapping changed during import.");
+                    }
+                }
+            }
+        }
+    }
+
+    // Counts written by the helper from the captured template, plus evenly spaced vertex samples,
+    // instead of re-reading both OBJs in DAZ Script.
+    // A DUF return (as Hair's) holds one morph per timeline frame ("frame_<n>"): each is 100% on
+    // its frame and 0 on the frames either side, as the FBX return's blend shape keys.
+    function keyFrameMorphs(node, startFrame, endFrame) {
+        var object = node.getObject();
+        var step = Scene.getTimeStep();
+        var keyed = 0;
+        for (var m = 0; object && m < object.getNumModifiers(); m++) {
+            var modifier = object.getModifier(m);
+            var match = /^frame_(\d+)$/.exec(String(modifier.name));
+            if (!match || !modifier.inherits("DzMorph")) continue;
+            var frame = parseInt(match[1], 10);
+            if (frame <= startFrame || frame > endFrame) throw new Error("The returned animation has an unexpected frame.");
+            var value = modifier.getValueControl();
+            value.setValue(step * (frame - 1), 0);
+            value.setValue(step * frame, 1);
+            if (frame < endFrame) value.setValue(step * (frame + 1), 0);
+            keyed++;
+        }
+        if (keyed !== endFrame - startFrame) {
+            throw new Error("The returned animation has " + keyed + " frame morphs; expected " + (endFrame - startFrame) + ".");
+        }
+    }
+
+    function verifySamples(node, item) {
+        node.getObject().forceCacheUpdate(node);
+        var mesh = node.getObject().getCachedGeom();
+        var returned = item.returned;
+        if (!mesh || !mesh.inherits("DzFacetMesh") || mesh.getNumVertices() !== item.entry.vertex_count ||
+                mesh.getNumFacets() !== returned.facet_count) {
+            throw new Error("The returned mesh has an unexpected vertex or polygon count (" +
+                (mesh ? mesh.getNumVertices() + " vertices, " + mesh.getNumFacets() + " polygons" : "no evaluated mesh") +
+                "; expected " + item.entry.vertex_count + " vertices, " + returned.facet_count + " polygons).");
+        }
+        // Static returns carry check_vertices; animations carry per-frame checks, the first of which
+        // is the start frame (where this check runs).
+        var indices = returned.check_indices;
+        var wanted = returned.check_vertices || (returned.checks && returned.checks.length ? returned.checks[0].vertices : null);
+        if (!indices || !wanted || wanted.length !== indices.length) {
+            throw new Error("The returned mesh has no verification samples.");
+        }
+        for (var k = 0; k < indices.length; k++) {
+            var point = mesh.getVertex(indices[k]);
+            var difference = Math.max(Math.abs(point.x - wanted[k][0]), Math.abs(point.y - wanted[k][1]),
+                Math.abs(point.z - wanted[k][2]));
+            if (!isFinite(difference) || difference > 0.0001) {
+                throw new Error("The returned mesh changed vertex order, scale or world placement.");
+            }
+        }
+        if (mesh.getNumMaterialGroups() !== returned.group_count) {
+            throw new Error("The returned mesh's surfaces changed during import (" + mesh.getNumMaterialGroups() +
+                " surfaces; expected " + returned.group_count + ").");
+        }
+    }
+
+    function verifySourceTopology(item, animated, liveReturn, sources) {
+        var node = item.original;
+        var object = node.getObject();
+        var expectedVertices = item.entry.vertex_count;
+        var expectedFacets = item.returned.facet_count;          // from the helper's template counts
+
+        function evaluate(force) {
+            if (force && typeof object.forceCacheUpdate === "function") object.forceCacheUpdate(node, false);
+            if (animated || force) {
+                node.update(false);
+                node.finalize(false, true);
+            }
+            return object.getCachedGeom();
+        }
+        function countsMatch(mesh) {
+            return mesh && mesh.inherits("DzFacetMesh") && mesh.getNumVertices() === expectedVertices &&
+                mesh.getNumFacets() === expectedFacets;
+        }
+        function verifyFacets(mesh) {
+            // Counts only (no per-polygon comparison).
+        }
+
+        var mesh = evaluate(false);
+        if (countsMatch(mesh)) {
+            verifyFacets(mesh);
+            return;
+        }
+
+        // A detached return can arrive after DAZ has invalidated its viewport
+        // cache or after a previous revision hid the original.
+        function follows(candidate, target) {
+            var follow = typeof candidate.getFollowTarget === "function" ? candidate.getFollowTarget() : null;
+            return follow && follow.elementID === target.elementID;
+        }
+        var visibility = [];
+        try {
+            if (liveReturn) {
+                var related = sources || [item];
+                for (var i = 0; i < related.length; i++) {
+                    var candidate = related[i].original;
+                    if (candidate.isVisible() || (candidate.elementID !== node.elementID &&
+                            !follows(candidate, node) && !follows(node, candidate))) continue;
+                    var control = candidate.getVisibilityControl();
+                    if (!control || control.isLocked()) continue;
+                    control.beginEdit();
+                    visibility.push(control);
+                    candidate.setVisible(true);
+                }
+            }
+            Scene.update();
+            mesh = evaluate(true);
+            if (countsMatch(mesh)) {
+                verifyFacets(mesh);
+                return;
+            }
+            var actual = mesh && mesh.inherits("DzFacetMesh") ?
+                mesh.getNumVertices() + " vertices and " + mesh.getNumFacets() + " polygons" : "no evaluated polygon mesh";
+            throw new Error(node.getLabel() + " at frame " + Scene.getFrame() +
+                "\nCaptured: " + expectedVertices + " vertices and " + expectedFacets + " polygons." +
+                "\nDAZ now reports " + actual + "." +
+                "\nCheck Resolution Level, View SubDivision Level and fitted grafts, or start a new capture.");
+        } finally {
+            if (visibility.length) {
+                while (visibility.length) visibility.pop().cancelEdit();
+                Scene.update();
+            }
+        }
+    }
+
+    function findSourceMaterial(original, name, capturedGrafts) {
+        var sourceShape = original.getObject().getCurrentShape();
+        var direct = sourceShape.findMaterial(name);
+        if (direct) return direct;
+        var grafts = capturedGrafts && capturedGrafts.length ? capturedGrafts : [];
+        if (!grafts.length && typeof original.getNumGraftFigures === "function") {
+            for (var g = 0; g < original.getNumGraftFigures(); g++) grafts.push(original.getGraftFigure(g));
+        }
+
+        // The captured assembly can contain surfaces owned by fitted grafts.
+        var suffixMatches = [];
+        for (var i = 0; i < grafts.length; i++) {
+            var graft = grafts[i];
+            var object = graft ? graft.getObject() : null;
+            var shape = object ? object.getCurrentShape() : null;
+            if (!shape) continue;
+            for (var m = 0; m < shape.getNumMaterials(); m++) {
+                var material = shape.getMaterial(m);
+                var suffix = "_" + material.name;
+                if (name === graft.name + suffix) return material;
+                if (name.slice(-suffix.length) === suffix && name.length > suffix.length) {
+                    suffixMatches.push(material);
+                }
+            }
+        }
+        return suffixMatches.length === 1 ? suffixMatches[0] : null;
+    }
+
+    function copyMaterials(original, target, materials, grafts) {
+        var targetShape = target.getObject().getCurrentShape();
+        for (var i = 0; i < targetShape.getNumMaterials(); i++) {
+            var targetMaterial = targetShape.getMaterial(i);
+            var match = null;
+            for (var m = 0; m < materials.length; m++) {
+                if (materials[m].token === targetMaterial.name) {
+                    match = materials[m];
+                    break;
+                }
+            }
+            var source = match ? findSourceMaterial(original, match.name, grafts) : null;
+            if (!source) {
+                throw new Error("Could not locate the original material " + (match ? match.name : targetMaterial.name) +
+                    " on " + original.getLabel() + " or its grafts.");
+            }
+            // Duplicate the original's materials onto the imported mesh.
+            var context = new DzElementDuplicateContext();
+            var duplicate = source.doDuplicateElement(context);
+            if (!duplicate) {
+                throw new Error("Could not duplicate the garment surface material.");
+            }
+            duplicate.name = targetMaterial.name;
+            duplicate.setLabel(source.getLabel());
+            if (duplicate.className() !== source.className() &&
+                    (duplicate.inherits("DzShaderMaterial") || duplicate.inherits("DzBrickMaterial"))) {
+                duplicate.setMaterialName(source.getMaterialName());
+            }
+            context.createAlaises();
+            context.createERC();
+            context.doResolve();
+            context.doFinalize();
+            if (Number(targetShape.replaceMaterial(targetMaterial, duplicate)) !== 0) {
+                throw new Error("Could not apply the original garment material.");
+            }
+            // The OBJ contains the UV coordinates captured for this drape.
+            var uvControl = duplicate.getUVSetControl();
+            if (uvControl) {
+                uvControl.setValue(0);
+            }
+        }
+    }
+
+    function sourceNodesFor(prepared) {
+        var sources = prepared.slice();
+        var known = {};
+        for (var i = 0; i < prepared.length; i++) known[prepared[i].original.elementID] = true;
+        for (var j = 0; j < prepared.length; j++) {
+            var item = prepared[j];
+            item.grafts = [];
+            var grafts = item.entry.grafts || [];
+            for (var k = 0; k < grafts.length; k++) {
+                var entry = grafts[k];
+                var node = Scene.findNodeByElementID(entry.id);
+                var object = node ? node.getObject() : null;
+                var target = node && typeof node.getFollowTarget === "function" ? node.getFollowTarget() : null;
+                if (!object || object.elementID !== entry.object_id || !target || target.elementID !== item.original.elementID) {
+                    throw new Error("A fitted piece on " + item.original.getLabel() + " changed after capture.");
+                }
+                item.grafts.push(node);
+                if (!known[node.elementID]) {
+                    sources.push({ original: node });
+                    known[node.elementID] = true;
+                }
+            }
+        }
+        return sources;
+    }
+
+    try {
+        var session = JSON.parse(readText(sessionPath));
+        var response = JSON.parse(readText(session.result_path));
+        var animated = response.output_mode === "animation";
+        var returnFrame = session.mode === "timeline" ? session.end_frame : session.frame;
+        if (session.version !== 2 || typeof returnFrame !== "number" ||
+                !isFinite(returnFrame) || Math.floor(returnFrame) !== returnFrame) {
+            throw new Error("The Drape session has an invalid return frame.");
+        }
+        var entries = session.meshes.filter(function (entry) { return entry.role === "garment"; });
+        if (response.version !== 1 || (!animated && response.output_mode !== "static") ||
+                response.session_id !== session.session_id || (!animated && response.frame !== returnFrame) ||
+                !Array.isArray(response.garments) || response.garments.length !== entries.length || !entries.length) {
+            throw new Error("The result does not match its captured Drape session.");
+        }
+        if (animated && (session.mode !== "timeline" || response.start_frame !== session.start_frame ||
+                response.end_frame !== session.end_frame || response.fps !== session.fps ||
+                Math.abs(4800 / Scene.getTimeStep().valueOf() - session.fps) > 0.00001 ||
+                response.take !== "DrapeAnimation")) {
+            throw new Error("The animation timing no longer matches the captured DAZ timeline.");
+        }
+        var prepared = [];
+        var waterResult = null;
+        var waterCopy = null;
+        if (response.water_plane) {
+            var expectedWaterPath = session.water_return_path || (session.session_id + "-water.obj");
+            if (normalPath(response.water_plane.path) !== normalPath(expectedWaterPath) ||
+                    response.water_plane.vertex_count !== 4 || typeof response.water_plane.height !== "number" ||
+                    !isFinite(response.water_plane.height)) {
+                throw new Error("The water-height plane does not match this session.");
+            }
+            waterResult = readObj(response.water_plane.path);
+            if (waterResult.vertices.length !== 4 || waterResult.polygons.length !== 1 ||
+                    waterResult.polygons[0].vertices.length !== 4) {
+                throw new Error("The water-height reference must be a single quad plane.");
+            }
+            for (var wv = 0; wv < 4; wv++) {
+                if (Math.abs(waterResult.vertices[wv][1] - response.water_plane.height) > 0.0001) {
+                    throw new Error("The returned water plane is not at the selected height.");
+                }
+            }
+        }
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            var returned = response.garments[i];
+            var original = Scene.findNodeByElementID(entry.id);
+            var object = original ? original.getObject() : null;
+            var shape = object ? object.getCurrentShape() : null;
+            if (!object || !shape || object.elementID !== entry.object_id || shape.elementID !== entry.shape_id) {
+                throw new Error("An original garment was removed or replaced while the helper was open.");
+            }
+            if (returned.id !== entry.id || returned.vertex_count !== entry.vertex_count ||
+                    normalPath(returned.path) !== normalPath(animated ? entry.animation_path : entry.return_path)) {
+                throw new Error("A returned garment does not match its source object.");
+            }
+            // DAZ native animation: a DUF scene next to the session's animation path.
+            if (returned.format !== undefined && (!animated || returned.format !== "duf" ||
+                    normalPath(returned.duf_path) !== normalPath(entry.animation_path).replace(/\.fbx$/i, ".duf"))) {
+                throw new Error("The returned animation file does not match its session.");
+            }
+            if (typeof returned.facet_count !== "number" || returned.facet_count < 1 ||
+                    typeof returned.group_count !== "number" || returned.group_count < 1) {
+                throw new Error("The result has no polygon/surface counts. Send it again from the helper.");
+            }
+            if (animated && (!Array.isArray(returned.check_indices) || !returned.check_indices.length ||
+                    !Array.isArray(returned.checks) || returned.checks.length < 2)) {
+                throw new Error("The returned animation has no verification samples.");
+            }
+            if (!animated) {
+                var checkIndices = returned.check_indices, checkVertices = returned.check_vertices;
+                if (!Array.isArray(checkIndices) || !checkIndices.length || !Array.isArray(checkVertices) ||
+                        checkVertices.length !== checkIndices.length) {
+                    throw new Error("The returned mesh has no verification samples.");
+                }
+                for (var ci = 0; ci < checkIndices.length; ci++) {
+                    var checkIndex = checkIndices[ci];
+                    if (checkIndex < 0 || checkIndex >= entry.vertex_count || Math.floor(checkIndex) !== checkIndex ||
+                            !Array.isArray(checkVertices[ci]) || checkVertices[ci].length !== 3) {
+                        throw new Error("Invalid verification sample.");
+                    }
+                }
+            }
+            prepared.push({ original: original, entry: entry, returned: returned });
+        }
+        var sourceNodes = sourceNodesFor(prepared);
+        importer = App.getImportMgr().findImporterByClassName(animated ? "DzFbxImporter" : "DzObjImporter");
+        if (!importer) {
+            throw new Error("DAZ's " + (animated ? "FBX" : "OBJ") + " importer is unavailable.");
+        }
+        var options = new DzFileIOSettings();
+        importer.getDefaultOptions(options);
+        options.setFloatValue("Scale", 1);
+        options.setStringValue("LatAxis", "X");
+        options.setStringValue("VertAxis", "Y");
+        options.setStringValue("DepthAxis", "Z");
+        options.setBoolValue("InvertLat", false);
+        options.setBoolValue("InvertVert", false);
+        options.setBoolValue("InvertDepth", false);
+        options.setBoolValue("IncludeG", false);
+        options.setBoolValue("IncludeVT", true);
+        options.setBoolValue("IncludeUsemtl", true);
+        options.setBoolValue("IncludeMtllib", false);
+        options.setBoolValue("WeldSeams", false);
+        options.setBoolValue("RemoveUnusedVerts", false);
+        options.setIntValue("RunSilent", 1);
+        if (animated) {
+            options.setBoolValue("IncludeAnimations", true);
+            options.setStringValue("Take", response.take);
+            options.setBoolValue("IncludePolygonSets", false);
+            options.setBoolValue("IncludePolygonGroups", false);
+            options.setBoolValue("IncludeNodeNamesLabels", false);
+            options.setBoolValue("IncludeSceneIDs", false);
+        }
+
+        Scene.beginTimeEdit();
+        timeEditOpen = true;
+        Scene.setFrame(animated ? session.start_frame : returnFrame);
+        Scene.update();
+        // Validate all sources before importing anything into the scene.
+        for (var v = 0; v < prepared.length; v++) {
+            verifySourceTopology(prepared[v], animated, session.live_return === true, sourceNodes);
+        }
+        for (var g = 0; g < prepared.length; g++) {
+            var item = prepared[g];
+            var before = {};
+            var previousNodes = Scene.getNodeList();
+            for (var b = 0; b < previousNodes.length; b++) {
+                before[previousNodes[b].elementID] = true;
+            }
+            var first = created.length;
+            var status;
+            try {
+                if (animated && g > 0) {
+                    importer.deleteLater();
+                    importer = App.getImportMgr().findImporterByClassName("DzFbxImporter");
+                    if (!importer) throw new Error("DAZ's FBX importer is unavailable.");
+                }
+                if (animated && item.returned.format === "duf") {
+                    // Merged into the open scene; its morphs are keyed below, one per timeline frame.
+                    status = App.getContentMgr().openFile(item.returned.duf_path, true) ? 0 : 1;
+                } else {
+                    status = importer.readFile(item.returned.path, options);
+                }
+            } finally {
+                var after = Scene.getNodeList();
+                for (var n = 0; n < after.length; n++) {
+                    if (!before[after[n].elementID]) {
+                        created.push(after[n]);
+                    }
+                }
+            }
+            if (Number(status) !== 0 || created.length !== first + 1) {
+                var labels = [];
+                for (var a = first; a < created.length; a++) {
+                    labels.push(created[a].getLabel());
+                }
+                throw new Error("Garment " + (g + 1) + " import status: " + status +
+                    ". DAZ added " + labels.length + " prop(s)" +
+                    (labels.length ? " [" + labels.join(", ") + "]" : "") + ".");
+            }
+            item.copy = created[first];
+            if (animated && item.returned.format === "duf") {
+                keyFrameMorphs(item.copy, session.start_frame, session.end_frame);
+            }
+        }
+        if (waterResult) {
+            waterImporter = App.getImportMgr().findImporterByClassName("DzObjImporter");
+            if (!waterImporter) throw new Error("DAZ's OBJ importer is unavailable for the water plane.");
+            var waterOptions = new DzFileIOSettings();
+            waterImporter.getDefaultOptions(waterOptions);
+            waterOptions.setFloatValue("Scale", 1);
+            waterOptions.setStringValue("LatAxis", "X");
+            waterOptions.setStringValue("VertAxis", "Y");
+            waterOptions.setStringValue("DepthAxis", "Z");
+            waterOptions.setBoolValue("InvertLat", false);
+            waterOptions.setBoolValue("InvertVert", false);
+            waterOptions.setBoolValue("InvertDepth", false);
+            waterOptions.setBoolValue("IncludeG", false);
+            waterOptions.setBoolValue("IncludeVT", true);
+            waterOptions.setBoolValue("IncludeUsemtl", true);
+            waterOptions.setBoolValue("IncludeMtllib", false);
+            waterOptions.setBoolValue("WeldSeams", false);
+            waterOptions.setBoolValue("RemoveUnusedVerts", false);
+            waterOptions.setIntValue("RunSilent", 1);
+            var waterBefore = {};
+            var waterNodes = Scene.getNodeList();
+            for (var wn = 0; wn < waterNodes.length; wn++) waterBefore[waterNodes[wn].elementID] = true;
+            var waterStart = created.length;
+            var waterStatus;
+            try {
+                waterStatus = waterImporter.readFile(response.water_plane.path, waterOptions);
+            } finally {
+                var waterAfter = Scene.getNodeList();
+                for (var wa = 0; wa < waterAfter.length; wa++) {
+                    if (!waterBefore[waterAfter[wa].elementID]) created.push(waterAfter[wa]);
+                }
+            }
+            if (Number(waterStatus) !== 0 || created.length !== waterStart + 1) {
+                throw new Error("Could not import the water-height plane.");
+            }
+            waterCopy = created[waterStart];
+        }
+        // Native importers close open undo holds. Begin post-import edits afterwards.
+        beginUndo();
+        undoOpen = true;
+        if (waterCopy) {
+            verifyGeometry(waterCopy, waterResult);
+            waterCopy.setLabel(Scene.getUniqueTopLevelLabel("Water - Drape Height", waterCopy));
+        }
+        for (var g = 0; g < prepared.length; g++) {
+            var item = prepared[g];
+            var copy = item.copy;
+            Scene.setFrame(animated ? session.start_frame : returnFrame);
+            Scene.update();
+            verifySamples(copy, item);
+            var pivot = item.original.getWSPos();
+            copy.adjustOrigin(pivot);
+            copy.getObject().forceCacheUpdate(copy);
+            verifySamples(copy, item);
+            var actualPivot = copy.getWSPos();
+            var pivotDifference = Math.max(Math.abs(actualPivot.x - pivot.x),
+                Math.abs(actualPivot.y - pivot.y), Math.abs(actualPivot.z - pivot.z));
+            if (!isFinite(pivotDifference) || pivotDifference > 0.0001) {
+                throw new Error("DAZ could not restore the garment's pivot.");
+            }
+            copyMaterials(item.original, copy, item.entry.materials, item.grafts);
+            if (animated) {
+                for (var check = 0; check < item.returned.checks.length; check++) {
+                    var sample = item.returned.checks[check];
+                    if (sample.frame < session.start_frame || sample.frame > session.end_frame ||
+                            !Array.isArray(sample.vertices) || sample.vertices.length !== item.returned.check_indices.length) {
+                        throw new Error("Invalid animation verification sample.");
+                    }
+                    Scene.setFrame(sample.frame);
+                    Scene.update();
+                    copy.getObject().forceCacheUpdate(copy);
+                    var animatedMesh = copy.getObject().getCachedGeom();
+                    for (var cv = 0; cv < sample.vertices.length; cv++) {
+                        var index = item.returned.check_indices[cv];
+                        if (index < 0 || index >= item.entry.vertex_count || Math.floor(index) !== index) {
+                            throw new Error("Invalid animation verification vertex.");
+                        }
+                        var point = animatedMesh.getVertex(index), wanted = sample.vertices[cv];
+                        var delta = Math.max(Math.abs(point.x - wanted[0]), Math.abs(point.y - wanted[1]), Math.abs(point.z - wanted[2]));
+                        if (!isFinite(delta) || delta > 0.001) {
+                            throw new Error("DAZ did not reproduce the garment animation at frame " + sample.frame + ".");
+                        }
+                    }
+                }
+                Scene.setFrame(session.start_frame);
+                Scene.update();
+            }
+            copy.setLabel(Scene.getUniqueTopLevelLabel(item.original.getLabel() + " - Deformed", copy));
+        }
+        Scene.setFrame(returnFrame);
+        Scene.update();
+        // Hide originals only after every returned garment has been verified.
+        for (var h = 0; h < sourceNodes.length; h++) {
+            var originalNode = sourceNodes[h].original;
+            if (!originalNode.isVisible()) continue;
+            var control = originalNode.getVisibilityControl();
+            control.beginEdit();
+            visibilityEdits.push(control);
+            if (control.isLocked()) {
+                throw new Error("The original garment's visibility is locked.");
+            }
+            originalNode.setVisible(false);
+            if (originalNode.isVisible()) {
+                throw new Error("Could not hide the original garment.");
+            }
+        }
+        while (visibilityEdits.length) {
+            visibilityEdits[0].finishEdit();
+            visibilityEdits.shift();
+        }
+        Scene.finishTimeEdit();
+        timeEditOpen = false;
+        acceptUndo(title);
+        undoOpen = false;
+        Scene.selectAllNodes(false);
+        for (var s = 0; s < created.length; s++) {
+            created[s].select(true);
+        }
+        Scene.setPrimarySelection(created[0]);
+        print(title + ": Returned " + prepared.length + (animated ? " animated" : " static") + " garment(s) at frame " + returnFrame + ". Originals are hidden." + (waterCopy ? " Added a separate water-height plane." : ""));
+    } catch (error) {
+        for (var c = visibilityEdits.length - 1; c >= 0; c--) {
+            visibilityEdits[c].cancelEdit();
+        }
+        if (timeEditOpen) {
+            Scene.finishTimeEdit();
+        }
+        if (undoOpen) {
+            cancelUndo();
+        }
+        for (var r = created.length - 1; r >= 0; r--) {
+            if (Scene.findNodeIndex(created[r]) >= 0) {
+                Scene.removeNode(created[r]);
+            }
+        }
+        Scene.setTime(originalTime);
+        Scene.selectAllNodes(false);
+        for (var p = 0; p < originalSelection.length; p++) {
+            originalSelection[p].select(true);
+        }
+        if (originalPrimary) {
+            Scene.setPrimarySelection(originalPrimary);
+        }
+        throw error;
+    } finally {
+        if (waterImporter && waterImporter !== importer) waterImporter.deleteLater();
+        if (importer) {
+            importer.deleteLater();
+        }
+    }
+})();

@@ -1,0 +1,340 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Staged scene selection for the Spin Soft Prop Tool.
+// Colour markers and role labels belong to this dialog's tree.
+(function () {
+    var title = "Spin Soft Prop Tool";
+    var folder = typeof spinSoftPropFolder === "string" ? spinSoftPropFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    if (!folder) {
+        MessageBox.warning("Run the saved Soft Prop Tool.dsa file or reinstall its menu item.", title, "OK", "");
+        return;
+    }
+    var stage = 0;
+    var sourceFrame = Scene.getFrame();
+    var timelineStart;
+    var timelineEnd;
+    try {
+        var frameTicks = Scene.getTimeStep().valueOf();
+        var timeline = Scene.getAnimRange();
+        timelineStart = Math.ceil(timeline.start.valueOf() / frameTicks - 1e-8);
+        timelineEnd = Math.floor(timeline.end.valueOf() / frameTicks + 1e-8);
+        if (!isFinite(frameTicks) || frameTicks <= 0 || !isFinite(timelineStart) ||
+                !isFinite(timelineEnd) || timelineEnd < timelineStart) {
+            throw new Error("Could not read the DAZ timeline range and frame rate.");
+        }
+    } catch (error) {
+        MessageBox.warning(error.message, title, "OK", "");
+        return;
+    }
+    var records = [];
+    var byNodeId = {};
+    var roles = ["moving", "garment"];
+    var labels = {
+        moving: "Collision object",
+        garment: "Soft prop"
+    };
+    var colors = {
+        moving: new Color(180, 110, 230),
+        garment: new Color(70, 160, 255)
+    };
+    var markers = {};
+
+    function marker(color) {
+        var pixmap = new Pixmap();
+        pixmap.resize(14, 14);
+        pixmap.fill(color);
+        return pixmap;
+    }
+    for (var role in colors) {
+        markers[role] = marker(colors[role]);
+    }
+    markers.none = marker(new Color(65, 65, 65));
+
+    var dialog = new DzBasicDialog();
+    dialog.caption = title + " - Scene Selection";
+    dialog.getWidget().objectName = "SpinSoftPropSceneSelection";
+    dialog.minWidth = 720;
+    dialog.minHeight = 620;
+    dialog.sizeGripEnabled = true;
+    dialog.showHelpButton(false);
+    dialog.showApplyButton(false);
+    dialog.setAcceptButtonText("Open Soft Prop Tool");
+    dialog.setCancelButtonText("Cancel");
+
+    var heading = new DzLabel(dialog);
+    heading.textFormat = DzLabel.PlainText;
+    dialog.addWidget(heading);
+    var legend = new DzLabel(dialog);
+    legend.textFormat = DzLabel.RichText;
+    legend.text = '<span style="color:#b46ee6">Purple - Collision objects</span> &nbsp; ' +
+        '<span style="color:#46a0ff">Blue - Soft props</span>';
+    dialog.addWidget(legend);
+    var instructions = new DzLabel(dialog);
+    instructions.textFormat = DzLabel.PlainText;
+    instructions.wordWrap = true;
+    dialog.addWidget(instructions);
+
+    var tree = new DzListView(dialog);
+    tree.addColumn("Scene object");
+    tree.addColumn("Assigned role");
+    tree.addColumn("Geometry");
+    tree.setColumnWidth(0, 340);
+    tree.setColumnWidth(1, 160);
+    tree.setColumnWidth(2, 120);
+    tree.setSorting(-1);
+    tree.rootIsDecorated = true;
+    tree.selectionMode = DzListView.Extended;
+    tree.minHeight = 320;
+    dialog.addWidget(tree, 1);
+
+    var actions = new DzWidget(dialog);
+    var actionLayout = new DzHBoxLayout(actions);
+    var assign = new DzPushButton(actions);
+    assign.autoDefault = false;
+    actionLayout.addWidget(assign);
+    var remove = new DzPushButton(actions);
+    remove.text = "Remove selected assignment";
+    remove.autoDefault = false;
+    actionLayout.addWidget(remove);
+    dialog.addWidget(actions);
+
+    var summary = new DzLabel(dialog);
+    summary.textFormat = DzLabel.PlainText;
+    summary.wordWrap = true;
+    dialog.addWidget(summary);
+    var animation = new DzCheckBox(dialog);
+    animation.text = "Use timeline animation (return an FBX sequence)";
+    animation.checked = sourceFrame > 0;
+    dialog.addWidget(animation);
+    var startLabel = new DzLabel(dialog);
+    startLabel.text = "Movement start frame";
+    dialog.addWidget(startLabel);
+    function frameControl(value) {
+        var control = new DzIntSlider(dialog);
+        // Expand the initial bounds first, including timelines that start above
+        // the widget's default maximum or use a negative starting frame.
+        control.min = Math.min(0, timelineStart);
+        control.max = Math.max(0, timelineEnd);
+        control.min = timelineStart;
+        control.max = timelineEnd;
+        control.clamped = true;
+        control.textVisible = true;
+        control.textEditable = true;
+        control.fullLengthEdit = true;
+        control.value = Math.max(timelineStart, Math.min(timelineEnd, value));
+        control.toolTip = "Frames " + timelineStart + " through " + timelineEnd +
+            ". Click the frame number to type a value.";
+        return control;
+    }
+    var startFrame = frameControl(0);
+    dialog.addWidget(startFrame);
+    var endLabel = new DzLabel(dialog);
+    endLabel.text = "Movement end frame";
+    dialog.addWidget(endLabel);
+    var endFrame = frameControl(Math.max(startFrame.value + 1, sourceFrame));
+    dialog.addWidget(endFrame);
+    var reviewControls = [animation, startLabel, startFrame, endLabel, endFrame];
+    var note = new DzLabel(dialog);
+    note.textFormat = DzLabel.PlainText;
+    note.wordWrap = true;
+    dialog.addWidget(note);
+
+    var back = new DzPushButton(dialog);
+    back.text = "Back";
+    back.autoDefault = false;
+    dialog.addButton(back, 0);
+    var next = new DzPushButton(dialog);
+    next.text = "Next";
+    next.autoDefault = false;
+    dialog.addButton(next, 1);
+
+    function hasMesh(node) {
+        var object = node.getObject();
+        var shape = object ? object.getCurrentShape() : null;
+        var mesh = shape ? shape.getGeometry() : null;
+        return !!(mesh && mesh.inherits("DzFacetMesh") && mesh.getNumFacets() > 0);
+    }
+
+    function addNode(node) {
+        if (byNodeId[node.elementID]) {
+            return byNodeId[node.elementID];
+        }
+        var parent = node.getNodeParent();
+        var parentRecord = parent ? addNode(parent) : null;
+        var index = records.length;
+        var item = new DzListViewItem(parentRecord ? parentRecord.item : tree, index);
+        var mesh = hasMesh(node);
+        var record = { node: node, item: item, mesh: mesh, role: "", parent: parentRecord };
+        records.push(record);
+        byNodeId[node.elementID] = record;
+        item.setText(0, node.getLabel());
+        item.setText(2, mesh ? "Own mesh" : "Container / bone");
+        item.selectable = mesh;
+        item.open = !parentRecord;
+        return record;
+    }
+
+    function refresh() {
+        var count = { fixed: 0, moving: 0, garment: 0 };
+        var visible = {};
+        for (var i = 0; i < records.length; i++) {
+            var record = records[i];
+            record.item.setText(1, record.role ? labels[record.role] : "Unassigned");
+            record.item.setPixmap(1, markers[record.role || "none"]);
+            if (record.role) {
+                count[record.role]++;
+                var ancestor = record;
+                while (ancestor) {
+                    visible[ancestor.node.elementID] = true;
+                    ancestor = ancestor.parent;
+                }
+            }
+        }
+        for (var v = 0; v < records.length; v++) {
+            records[v].item.visible = stage !== 2 || !!visible[records[v].node.elementID];
+            if (stage === 2 && visible[records[v].node.elementID]) {
+                records[v].item.open = true;
+            }
+        }
+        var headings = [
+            "Stage 1 of 3 - Collision objects",
+            "Stage 2 of 3 - Soft props to deform",
+            "Stage 3 of 3 - Review and send"
+        ];
+        heading.text = headings[stage];
+        if (stage < 2) {
+            heading.paletteForegroundColor = colors[roles[stage]];
+            assign.text = "Assign selected as " + labels[roles[stage]];
+            instructions.text = "Select one or more mesh rows, then click Assign selected. " +
+                "Ctrl-click selects multiple objects. Double-click also assigns an object. " +
+                "An assignment includes only that object's own mesh.";
+        } else {
+            heading.paletteForegroundColor = new Color(220, 220, 220);
+            instructions.text = "Review the exact objects below. Use Back to change their roles. " +
+                "No unassigned objects or automatically selected children will be exported.";
+        }
+        assign.enabled = stage < 2;
+        back.enabled = stage > 0;
+        next.enabled = stage < 2;
+        var valid = count.garment > 0 && count.moving > 0;
+        for (var c = 0; c < reviewControls.length; c++) {
+            if (stage === 2) {
+                reviewControls[c].show();
+            } else {
+                reviewControls[c].hide();
+            }
+        }
+        startFrame.enabled = animation.checked;
+        endFrame.enabled = animation.checked;
+        var validRange = !animation.checked || (endFrame.value > startFrame.value &&
+            startFrame.value >= timelineStart && endFrame.value <= timelineEnd);
+        dialog.setAcceptButtonEnabled(stage === 2 && valid && validRange);
+        summary.text = "Collision objects: " + count.moving +
+            "    Soft props: " + count.garment + "    Capture frame: " + Scene.getFrame() +
+            "\nTimeline: " + timelineStart + " through " + timelineEnd + ". Click a frame number to type it.";
+        if (stage === 2 && !valid) {
+            summary.text += "\nAssign at least one soft prop and at least one collision object before opening the helper.";
+        }
+        if (animation.checked) {
+            note.text = validRange ?
+                "Timeline movement defaults to frames " + startFrame.value + " through " + endFrame.value +
+                ". Soft props are captured at the start. Moving colliders are captured at every frame. " +
+                "The original DAZ frame is restored after capture." :
+                "The movement end frame must be later than the start frame.";
+        } else {
+            note.text = "Current-frame deformation at frame " + sourceFrame +
+                ". Return the deformed current pose as a static mesh. Enable timeline movement for animation output.";
+        }
+    }
+
+    function assignSelected() {
+        if (stage >= 2) {
+            return;
+        }
+        var selected = tree.getItems(DzListView.Selected);
+        for (var i = 0; i < selected.length; i++) {
+            var record = records[selected[i].id];
+            if (record && record.mesh) {
+                record.role = roles[stage];
+            }
+        }
+        refresh();
+    }
+
+    connect(assign, "clicked()", assignSelected);
+    connect(animation, "toggled(bool)", refresh);
+    connect(startFrame, "valueChanged(int)", refresh);
+    connect(endFrame, "valueChanged(int)", refresh);
+    connect(remove, "clicked()", function () {
+        var selected = tree.getItems(DzListView.Selected);
+        for (var i = 0; i < selected.length; i++) {
+            records[selected[i].id].role = "";
+        }
+        refresh();
+    });
+    connect(back, "clicked()", function () {
+        if (stage > 0) {
+            stage--;
+            tree.clearSelection();
+            refresh();
+        }
+    });
+    connect(next, "clicked()", function () {
+        if (stage < 2) {
+            stage++;
+            tree.clearSelection();
+            refresh();
+        }
+    });
+    connect(tree, "doubleClicked(DzListViewItem*,const QPoint&,int)", function (item) {
+        if (item && records[item.id].mesh && stage < 2) {
+            records[item.id].role = roles[stage];
+            refresh();
+        }
+    });
+
+    try {
+        var nodes = Scene.getNodeList();
+        for (var i = 0; i < nodes.length; i++) {
+            addNode(nodes[i]);
+        }
+        refresh();
+        if (!dialog.exec()) {
+            return;
+        }
+        var captureOptions = {
+            use_animation: animation.checked,
+            start_frame: startFrame.value,
+            end_frame: endFrame.value,
+            output_mode: animation.checked ? "animation" : "static"
+        };
+        var selection = [];
+        for (var s = 0; s < records.length; s++) {
+            if (records[s].role) {
+                selection.push({ id: records[s].node.elementID, role: records[s].role });
+            }
+        }
+        var file = new DzFile(folder + "SoftProp_ExportMesh.dsa");
+        if (!file.open(DzFile.ReadOnly)) {
+            throw new Error("Could not open the soft prop bridge script.");
+        }
+        var code;
+        try {
+            code = file.read();
+        } finally {
+            file.close();
+        }
+        var script = new DzScript();
+        script.setCode("var spinSoftPropFolder = " + JSON.stringify(folder) + ";\n" +
+            "var drapeSceneSelection = " + JSON.stringify(selection) + ";\n" +
+            "var drapeCaptureOptions = " + JSON.stringify(captureOptions) + ";\n" + code);
+        if (!script.execute()) {
+            throw new Error(script.errorMessage());
+        }
+    } catch (error) {
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

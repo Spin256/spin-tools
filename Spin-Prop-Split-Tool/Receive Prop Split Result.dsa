@@ -1,0 +1,359 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Import the latest split sent for the current Prop Split capture and hide the original.
+// Each Send is a revision; a newer one replaces (hides) the previous split's pieces.
+// Run by the Spin Tools receive window (spinPropSplitReceiveOnce = true), which
+// verifies the pieces, imports them and copies the original's materials.
+(function () {
+    var title = "Spin Prop Split Tool";
+    var folder = typeof spinPropSplitFolder === "string" ? spinPropSplitFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var stateSettings = new DzAppSettings("Spin256/PropSplit/" + App.getApplicationDataName());
+
+    function readText(path) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.ReadOnly)) throw new Error("Could not read " + path);
+        try { return file.read().replace(/^﻿/, ""); }
+        finally { file.close(); }
+    }
+
+    function readState() {
+        return JSON.parse(stateSettings.getStringValue("LiveReturn", "") || "{}");
+    }
+
+    function saveState(state) {
+        if (!stateSettings.setStringValue("LiveReturn", JSON.stringify(state))) {
+            throw new Error("DAZ could not save the Prop Split receive state.");
+        }
+    }
+
+    function normalPath(path) {
+        return String(path).replace(/\\/g, "/").toLowerCase();
+    }
+
+    var state = readState();
+    if (!state.session || !new DzFile(state.session).exists()) {
+        MessageBox.information("Open Spin Prop Split Tool to split a prop first.", title, "OK");
+        return;
+    }
+    var latest = state.session.replace(/\.json$/, ".latest");
+    if (!new DzFile(latest).exists()) return;
+    var revision = readText(latest).replace(/\\/g, "/");
+    if (revision === state.received) return;
+
+    var session = JSON.parse(readText(state.session));
+    var pieces = [];
+    var sourceId = session.source_id;
+    var sourceObjectId = session.source_object_id;
+    var label = session.label;
+    var rigged = !!session.rigged;
+    var sourceState = session.source_state;
+    var original = Scene.findNodeByElementID(sourceId);
+    var importer = null;
+    var created = [];
+    var undoOpen = false;
+    var replaced = false;
+
+    function supportedHierarchy(node) {
+        var children = node.getNodeChildren(true);
+        if (!rigged) {
+            return children.length === 0;
+        }
+        for (var i = 0; i < children.length; i++) {
+            if (!children[i].inherits("DzBone") || children[i].getObject()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function optionsFor(handler) {
+        var options = new DzFileIOSettings();
+        handler.getDefaultOptions(options);
+        options.setFloatValue("Scale", 1);
+        options.setStringValue("LatAxis", "X");
+        options.setStringValue("VertAxis", "Y");
+        options.setStringValue("DepthAxis", "Z");
+        options.setBoolValue("InvertLat", false);
+        options.setBoolValue("InvertVert", false);
+        options.setBoolValue("InvertDepth", false);
+        options.setIntValue("RunSilent", 1);
+        return options;
+    }
+
+    function difference(point, xyz) {
+        return Math.max(Math.abs(point.x - xyz[0]), Math.abs(point.y - xyz[1]),
+            Math.abs(point.z - xyz[2]));
+    }
+
+    function verifyMesh(node, expected) {
+        var geometry = node.getObject().getCachedGeom();
+        if (!geometry || !geometry.inherits("DzFacetMesh") ||
+                geometry.getNumFacets() !== expected.faces ||
+                geometry.getNumVertices() !== expected.vertices.length) {
+            throw new Error("The imported piece has a different polygon or vertex count.");
+        }
+        for (var i = 0; i < expected.vertices.length; i++) {
+            if (!(difference(geometry.getVertex(i), expected.vertices[i]) <= 0.0001)) {
+                throw new Error("Imported vertex " + i + " moved or changed order.");
+            }
+        }
+    }
+
+    function facetVertices(facet) {
+        var vertices = [facet.vertIdx1, facet.vertIdx2, facet.vertIdx3];
+        if (facet.vertIdx4 >= 0) {
+            vertices.push(facet.vertIdx4);
+        }
+        return vertices;
+    }
+
+    function polygonKey(vertices) {
+        return vertices.slice().sort(function (a, b) { return a - b; }).join(",");
+    }
+
+    function sourceMaterialsByPolygon(geometry) {
+        var materials = {};
+        for (var i = 0; i < geometry.getNumFacets(); i++) {
+            var face = geometry.getFacet(i);
+            var key = polygonKey(facetVertices(face));
+            var group = geometry.getMaterialGroup(face.materialIndex);
+            if (!group) {
+                throw new Error("The source has a polygon without a material group.");
+            }
+            var name = group.name;
+            if (key in materials && materials[key] !== name) {
+                throw new Error("Coincident source polygons have different materials.");
+            }
+            materials[key] = name;
+        }
+        return materials;
+    }
+
+    function copyMaterials(sourceShape, targetShape, piece, sourceState, byPolygon) {
+        var mesh = targetShape.getGeometry();
+        var sourceNames = Object.create(null);
+        var i;
+        for (i = 0; i < piece.source_vertices.length; i++) {
+            var sourcePoint = sourceState.vertices[piece.source_vertices[i]];
+            if (!sourcePoint || piece.vertices[i].some(function (value, axis) {
+                return Math.abs(value - sourcePoint[axis]) > 0.0001;
+            })) {
+                throw new Error("The OBJ exporter changed source vertex order or positions.");
+            }
+        }
+        var expected = {};
+        for (i = 0; i < piece.polygons.length; i++) {
+            var polygon = piece.polygons[i];
+            var sourceKey = polygonKey(polygon.map(function (index) {
+                return piece.source_vertices[index];
+            }));
+            if (!(sourceKey in byPolygon)) {
+                throw new Error("An exported polygon does not match the source mesh.");
+            }
+            expected[polygonKey(polygon)] = byPolygon[sourceKey];
+        }
+        for (i = 0; i < mesh.getNumFacets(); i++) {
+            var face = mesh.getFacet(i);
+            var key = polygonKey(facetVertices(face));
+            var group = mesh.getMaterialGroup(face.materialIndex);
+            if (!group || !(key in expected)) {
+                throw new Error("An imported polygon or material group could not be verified.");
+            }
+            var targetName = group.name;
+            if (targetName in sourceNames && sourceNames[targetName] !== expected[key]) {
+                throw new Error("DAZ combined polygons with different source materials into one surface.");
+            }
+            sourceNames[targetName] = expected[key];
+        }
+
+        var count = 0;
+        for (var name in sourceNames) {
+            var target = targetShape.findMaterial(name);
+            var source = sourceShape.findMaterial(sourceNames[name]);
+            if (!source || !target) {
+                throw new Error("Material lookup failed on the selected prop or imported piece. " +
+                    "Source surface: '" + sourceNames[name] + "'. Imported surface: '" + name + "'.");
+            }
+            var context = new DzElementDuplicateContext();
+            var duplicate = source.doDuplicateElement(context);
+            if (!duplicate) {
+                throw new Error("Could not copy material '" + target.name + "'.");
+            }
+            duplicate.name = target.name;
+            duplicate.setLabel(source.getLabel());
+            if (duplicate.className() !== source.className() &&
+                    (duplicate.inherits("DzShaderMaterial") || duplicate.inherits("DzBrickMaterial"))) {
+                duplicate.setMaterialName(source.getMaterialName());
+            }
+            context.createAlaises();
+            context.createERC();
+            context.doResolve();
+            context.doFinalize();
+            if (Number(targetShape.replaceMaterial(target, duplicate)) !== 0) {
+                throw new Error("Could not assign material '" + target.name + "'.");
+            }
+            count++;
+        }
+        return count;
+    }
+
+    function importPiece(index, expected, options, sourceState, byPolygon) {
+        var previous = {};
+        for (var indexBefore = 0; indexBefore < Scene.getNumNodes(); indexBefore++) {
+            previous[Scene.getNode(indexBefore).elementID] = true;
+        }
+        var first = created.length;
+        var status;
+        try {
+            status = importer.readFile(pieces[index], options);
+        } finally {
+            for (var i = 0; i < Scene.getNumNodes(); i++) {
+                var node = Scene.getNode(i);
+                if (!previous[node.elementID]) {
+                    created.push(node);
+                }
+            }
+        }
+        if (Number(status) !== 0 || created.length !== first + 1) {
+            var labels = [];
+            for (var j = first; j < created.length; j++) {
+                labels.push(created[j].getLabel());
+            }
+            throw new Error("Piece " + (index + 1) + " import status: " + status +
+                ". DAZ added " + labels.length + " prop(s)" +
+                (labels.length ? " [" + labels.join(", ") + "]" : "") + ".");
+        }
+        var copy = created[first];
+        verifyMesh(copy, expected);
+        var pivot = expected.pivot;
+        copy.adjustOrigin(new DzVec3(pivot[0], pivot[1], pivot[2]));
+        copy.getObject().forceCacheUpdate(copy);
+        verifyMesh(copy, expected);
+        if (!(difference(copy.getWSPos(), pivot) <= 0.0001)) {
+            throw new Error("DAZ could not set the pivot for piece " + (index + 1) + ".");
+        }
+        var suffix = " - " + (expected.name || (index === 0 ? "Selected" : "Remainder"));
+        copy.setLabel(Scene.getUniqueTopLevelLabel(label + suffix, copy));
+        return copyMaterials(original.getObject().getCurrentShape(),
+            copy.getObject().getCurrentShape(), expected, sourceState, byPolygon);
+    }
+
+    try {
+        // Each Send is its own revision folder: <session>-return-<id>/result.json.
+        var revisionPrefix = normalPath(state.session).replace(/\.json$/, "-return-");
+        var revisionPath = normalPath(revision);
+        if (session.version !== 1 || revisionPath.indexOf(revisionPrefix) !== 0 ||
+                !/^[\w-]+\/result\.json$/.test(revisionPath.substring(revisionPrefix.length))) {
+            throw new Error("The split result does not belong to this capture.");
+        }
+        // A previous Send's pieces are hidden once this one imports.
+        var previousPieces = [];
+        var previous = state.nodes || [];
+        for (var q = 0; q < previous.length; q++) {
+            var previousNode = Scene.findNodeByElementID(previous[q].id);
+            var previousObject = previousNode ? previousNode.getObject() : null;
+            if (previousNode && previousNode.isVisible() &&
+                    (previousObject ? previousObject.elementID : null) === previous[q].object) {
+                if (previousNode.getVisibilityControl().isLocked()) {
+                    throw new Error("Unlock the previous split pieces' visibility before receiving a new split.");
+                }
+                previousPieces.push(previousNode);
+            }
+        }
+        importer = App.getImportMgr().findImporterByClassName("DzObjImporter");
+        if (!importer) {
+            throw new Error("DAZ's OBJ importer is unavailable.");
+        }
+        var data = JSON.parse(readText(revision));
+        // Pieces sit beside the result; their names come from the selector (two or more).
+        var resultFolder = String(revision).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+        var totalFaces = 0;
+        for (var p = 0; Array.isArray(data) && p < data.length; p++) {
+            if (typeof data[p].file !== "string" || /[\/\\]/.test(data[p].file)) {
+                throw new Error("The split result names an invalid piece file.");
+            }
+            pieces.push(resultFolder + data[p].file);
+            totalFaces += data[p].faces;
+        }
+        original = Scene.findNodeByElementID(sourceId);
+        if (!original) {
+            throw new Error("The original prop is no longer in the scene.");
+        }
+        if (!supportedHierarchy(original)) {
+            throw new Error("The original prop's hierarchy changed while the selector was open.");
+        }
+        var currentObject = original.getObject();
+        if (!currentObject || currentObject.elementID !== sourceObjectId) {
+            throw new Error("The original prop's mesh object was replaced while the selector was open.");
+        }
+        if (!original.isVisible()) {
+            // Hidden by an earlier Send: refresh its evaluated mesh before verifying.
+            original.getObject().forceCacheUpdate(original);
+        }
+        verifyMesh(original, sourceState);
+        if (!Array.isArray(data) || data.length < 2 || totalFaces !== sourceState.faces) {
+            throw new Error("The returned pieces do not match the original polygon count.");
+        }
+
+        var input = optionsFor(importer);
+        input.setBoolValue("IncludeG", false);
+        input.setBoolValue("IncludeVT", true);
+        input.setBoolValue("IncludeUsemtl", true);
+        input.setBoolValue("IncludeMtllib", false);
+        beginUndo();
+        undoOpen = true;
+        var byPolygon = sourceMaterialsByPolygon(original.getObject().getCachedGeom());
+        var materialCount = 0;
+        for (var n = 0; n < data.length; n++) {
+            materialCount += importPiece(n, data[n], input, sourceState, byPolygon);
+        }
+        // Hide the original instead of deleting it, so it stays available to undo,
+        // re-split or compare. Hiding is part of the same undo step as the import.
+        original.setVisible(false);
+        if (original.isVisible()) {
+            throw new Error("Could not hide the original prop.");
+        }
+        for (var h = 0; h < previousPieces.length; h++) {
+            previousPieces[h].setVisible(false);
+            if (previousPieces[h].isVisible()) {
+                throw new Error("Could not hide the previous split pieces.");
+            }
+        }
+        replaced = true;
+        acceptUndo(title);
+        undoOpen = false;
+        Scene.setPrimarySelection(created[0]);
+        var records = [];
+        for (var r = 0; r < created.length; r++) {
+            var createdObject = created[r].getObject();
+            records.push({ id: created[r].elementID, object: createdObject ? createdObject.elementID : null });
+        }
+        saveState({ session: state.session, received: revision, nodes: records });
+        print("Split into " + data.length + " props (" + totalFaces + " polygons). Copied " +
+            materialCount + " DAZ surface material(s). The original is hidden in the Scene pane." +
+            (previousPieces.length ? " The previous split is hidden." : ""));
+    } catch (error) {
+        if (undoOpen) {
+            cancelUndo();
+        }
+        if (!replaced) {
+            for (var i = created.length - 1; i >= 0; i--) {
+                if (Scene.findNodeIndex(created[i]) >= 0) {
+                    Scene.removeNode(created[i]);
+                }
+            }
+        }
+        print(title + ": " + error.message);
+        var current = readState();
+        if (current.session === state.session && current.received !== revision) {
+            current.receiveError = { revision: revision, message: error.message };
+            saveState(current);
+        }
+    } finally {
+        if (importer) {
+            importer.deleteLater();
+        }
+    }
+})();

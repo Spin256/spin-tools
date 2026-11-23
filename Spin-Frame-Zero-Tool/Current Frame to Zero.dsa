@@ -1,0 +1,194 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Current Frame to Zero — independent DAZ scene utility.
+// Copyright Spin256 · https://www.spin256.com/tools
+// Node/Skeleton properties hold references (including Fit To), not JSON values.
+// DAZ API references:
+// https://docs.daz3d.com/public/software/dazstudio/4/referenceguide/scripting/api_reference/object_index/property_dz
+// https://docs.daz3d.com/public/software/dazstudio/4/referenceguide/scripting/api_reference/object_index/element_dz
+(function () {
+    var title = "Current Frame to Zero";
+    var sourceFrame = Scene.getFrame();
+    var sourceTime = Scene.getTime();
+    var records = [];
+    var properties = [];
+    var seenElements = {};
+    var undoOpen = false;
+    var timeEditOpen = false;
+    var keysRemoved = 0;
+
+    // Settings serialization order and insignificant floating-point roundoff
+    // must not cause a valid conversion to be rejected.
+    function sameValue(a, b) {
+        if (typeof a !== typeof b) return false;
+        if (typeof a === "number") return isFinite(a) && isFinite(b) &&
+            Math.abs(a-b) <= 1e-7 * Math.max(1, Math.abs(a), Math.abs(b));
+        if (a === null || b === null || typeof a !== "object") return a === b;
+        var aKeys = Object.keys(a), bKeys = Object.keys(b);
+        if (aKeys.length !== bKeys.length) return false;
+        for (var k=0; k<aKeys.length; k++) {
+            var key=aKeys[k];
+            if (!Object.prototype.hasOwnProperty.call(b,key) || !sameValue(a[key],b[key])) return false;
+        }
+        return true;
+    }
+
+    function collectProperty(property) {
+        var aliases = [];
+        while (property && property.isAlias()) {
+            if (aliases.indexOf(property) >= 0) {
+                throw new Error("A property contains a circular alias.");
+            }
+            aliases.push(property);
+            property = property.getAliasTarget();
+        }
+        if (!property || !property.canAnimate() || property.getNumKeys() === 0 || properties.indexOf(property) >= 0) {
+            return;
+        }
+        var isNode = property.inherits("DzNodeProperty");
+        var value = null;
+        var settings = null;
+        if (isNode) {
+            value = property.getValue(sourceTime);
+        } else {
+            settings = new DzSettings();
+            // Save raw inputs, retaining ERC/pose-control contributions exactly once.
+            property.addValueToSettings(sourceTime, settings, DzProperty.Standard);
+            if (settings.getNumValues() === 0) {
+                throw new Error("Could not capture animated property: " + property.getLabel() + ". No changes were made.");
+            }
+        }
+        properties.push(property);
+        records.push({
+            property: property,
+            settings: settings,
+            isNode: isNode,
+            value: value,
+            locked: property.isLocked(),
+            editOpen: false
+        });
+        keysRemoved += property.getNumKeys();
+    }
+
+    function collectElement(element) {
+        if (!element || !element.inherits("DzElement") || seenElements[element.elementID]) {
+            return;
+        }
+        seenElements[element.elementID] = true;
+        var list = element.getPropertyList().concat(element.getPrivatePropertyList());
+        for (var i = 0; i < list.length; i++) {
+            collectProperty(list[i]);
+        }
+        for (var j = 0; j < element.getNumElementChildren(); j++) {
+            collectElement(element.getElementChild(j));
+        }
+        // Visit these owners explicitly as well as through the element tree.
+        if (element.inherits("DzNode")) {
+            collectElement(element.getObject());
+        } else if (element.inherits("DzObject")) {
+            for (var m = 0; m < element.getNumModifiers(); m++) {
+                collectElement(element.getModifier(m));
+            }
+            for (var s = 0; s < element.getNumShapes(); s++) {
+                collectElement(element.getShape(s));
+            }
+        } else if (element.inherits("DzShape")) {
+            for (var t = 0; t < element.getNumMaterials(); t++) {
+                collectElement(element.getMaterial(t));
+            }
+        }
+    }
+
+    try {
+        // Scene nodes include figures, bones, props, cameras and lights. Their
+        // element trees include geometry, morph modifiers, shapes and materials.
+        var nodes = Scene.getNodeList();
+        for (var i = 0; i < nodes.length; i++) {
+            collectElement(nodes[i]);
+        }
+        collectElement(Scene.getBackdrop());
+        for (var d = 0; d < Scene.getNumDataItems(); d++) {
+            collectElement(Scene.getDataItem(d));
+        }
+        for (var w = 0; w < Scene.getNumWSModifiers(); w++) {
+            collectElement(Scene.getWSModifier(w));
+        }
+
+        beginUndo();
+        undoOpen = true;
+        Scene.beginTimeEdit();
+        timeEditOpen = true;
+        for (var j = 0; j < records.length; j++) {
+            var record = records[j];
+            record.property.beginEdit();
+            record.editOpen = true;
+            record.property.lock(false);
+            record.property.deleteAllKeys();
+            if (record.property.getNumKeys() !== 0) {
+                throw new Error("Could not clear all keys on " + record.property.getLabel() + ".");
+            }
+        }
+
+        Scene.setFrame(0);
+        for (var k = 0; k < records.length; k++) {
+            var saved = records[k];
+            if (saved.isNode) saved.property.setValue(Scene.getTime(), saved.value);
+            else saved.property.setValueFromSettings(Scene.getTime(), saved.settings, DzProperty.Standard);
+        }
+        // Verify after restoring every driver, so dependent properties have their
+        // final inputs before comparing their raw values.
+        for (var p = 0; p < records.length; p++) {
+            var result = records[p];
+            var property = result.property;
+            if (result.isNode) {
+                if (property.getValue(Scene.getTime()) !== result.value) {
+                    throw new Error("Could not preserve the node reference for " + property.getLabel() + ".");
+                }
+            } else {
+                var check = new DzSettings();
+                property.addValueToSettings(Scene.getTime(), check, DzProperty.Standard);
+                if (!sameValue(JSON.parse(check.toJsonString()), JSON.parse(result.settings.toJsonString()))) {
+                    throw new Error("The captured value could not be restored for " + property.getLabel() + ".");
+                }
+            }
+            if (property.getNumKeys() > 1 ||
+                    (property.getNumKeys() === 1 && Number(property.getKeyTime(0)) !== 0)) {
+                throw new Error("Animation keys remain outside frame zero on " + property.getLabel() + ".");
+            }
+            property.lock(result.locked);
+        }
+        Scene.setAnimRange(new DzTimeRange(0, 0));
+        Scene.setPlayRange(new DzTimeRange(0, 0));
+        Scene.finishTimeEdit();
+        timeEditOpen = false;
+        for (var e = 0; e < records.length; e++) {
+            records[e].property.finishEdit();
+            records[e].editOpen = false;
+        }
+        acceptUndo(title);
+        undoOpen = false;
+
+        var message = "Kept the scene at frame " + sourceFrame + " as frame 0. Cleared " +
+            keysRemoved + " original key(s) across " + records.length + " animated properties. " +
+            "The timeline now contains one frame.";
+        print(title + ": " + message);
+        MessageBox.information(message, title, "OK");
+    } catch (error) {
+        for (var r = records.length - 1; r >= 0; r--) {
+            if (records[r].editOpen) {
+                try { records[r].property.cancelEdit(); } catch (cleanupError) { print(title + ": " + cleanupError.message); }
+                records[r].editOpen = false;
+            }
+            try { records[r].property.lock(records[r].locked); } catch (lockError) { print(title + ": " + lockError.message); }
+        }
+        if (timeEditOpen) {
+            try { Scene.finishTimeEdit(); } catch (timeError) { print(title + ": " + timeError.message); }
+        }
+        if (undoOpen) {
+            cancelUndo();
+        }
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

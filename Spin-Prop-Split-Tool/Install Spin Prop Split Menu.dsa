@@ -1,0 +1,70 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Register the existing bridge as a DAZ Studio menu action.
+(function () {
+    var title = "Install Spin Prop Split Tool menu";
+    // Inside "Install Spin Tools Menu.dsa" the suite shows one summary instead.
+    var quiet = false;
+    try { quiet = new DzAppSettings("Spin256/Installer").getStringValue("Quiet", "") === "1"; } catch (e) {}
+    var folder = String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var path = folder + "Split Selected Prop.dsa";
+    try {
+        if (!folder) throw new Error("Run the saved Install Spin Prop Split Menu.dsa file.");
+        if (!new DzFileInfo(path).exists()) {
+            throw new Error("Could not find " + path);
+        }
+        var description = "Open the selected DAZ prop in Spin Prop Split Tool";
+        var launcher = "(function () {" +
+            "var file = new DzFile(" + JSON.stringify(path) + ");" +
+            "if (!file.open(DzFile.ReadOnly)) {" +
+            "MessageBox.warning('Cannot open the bridge script.', 'Spin Prop Split Tool', 'OK', ''); return; }" +
+            "var code = file.read(); file.close();" +
+            "var script = new DzScript(); script.setCode('var spinPropSplitFolder = ' + " +
+            JSON.stringify(JSON.stringify(folder)) + " + ';\\n' + code);" +
+            "if (!script.execute()) {" +
+            "MessageBox.warning(script.errorMessage(), 'Spin Prop Split Tool', 'OK', ''); }" +
+            "})();";
+        var manager = MainWindow.getActionMgr();
+        var action = "";
+        for (var i = 0; i < manager.getNumCustomActions(); i++) {
+            var file = String(manager.getCustomActionFile(i)).replace(/\\/g, "/");
+            if (file.toLowerCase() === path.toLowerCase() ||
+                    manager.getCustomActionDesc(i) === description) {
+                manager.setCustomActionScript(i, launcher, false);
+                manager.setCustomActionText(i, "Split Selected Prop...");
+                if (typeof manager.setCustomActionDescription === "function") {
+                    manager.setCustomActionDescription(i, description);
+                }
+                action = manager.getCustomActionName(i);
+                break;
+            }
+        }
+        if (!action) {
+            action = manager.addCustomAction("Split Selected Prop...",
+                description, launcher, false, "", "");
+        }
+        if (!action) {
+            throw new Error("DAZ Studio could not register the bridge action.");
+        }
+        var scriptsMenu = manager.getMenu().getSubMenu("&Scripts");
+        var menu = scriptsMenu.findOrCreateSubMenu("Spin Tools");
+        var items = menu.getItemList();
+        var installed = false;
+        for (var j = 0; j < items.length; j++) {
+            if (items[j].type == DzActionMenuItem.CustomAction && items[j].action == action) {
+                installed = true;
+                break;
+            }
+        }
+        if (!installed) {
+            menu.insertCustomAction(action, -1);
+        }
+        if (!quiet) MessageBox.information("Select a prop, then choose Scripts > Spin Tools > Split Selected Prop.",
+            title, "OK");
+    } catch (error) {
+        if (quiet) throw error;
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();
+

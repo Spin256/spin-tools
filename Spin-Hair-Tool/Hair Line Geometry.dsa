@@ -1,0 +1,40 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Temporary viewport tessellation for line-based hair; render settings stay intact.
+// Evaluates to a utility object for the capture and return scripts.
+(function () {
+    function prepare(node, requestedSides, edits) {
+        var object = node.getObject();
+        if (!object) throw new Error("No geometry on " + node.getLabel() + ".");
+        object.forceCacheUpdate(node);
+        var mesh = object.getCachedGeom();
+        if (!requestedSides && mesh && mesh.getNumFacets() > 0) return 0;
+        if (!requestedSides && !(mesh && typeof mesh.getNumPolylines === "function" &&
+                mesh.getNumPolylines() > 0)) return 0;
+        var modifier = null;
+        for (var i = 0; i < object.getNumModifiers(); i++) {
+            var candidate = object.getModifier(i);
+            if (candidate.inherits("DzLineTessellationModifier")) { modifier = candidate; break; }
+        }
+        if (!modifier) throw new Error(node.getLabel() + " contains hair lines but has no Line Tessellation modifier.");
+        var control = modifier.getViewportSidesControl();
+        var sides = requestedSides || 1; // A ribbon per line, rather than a heavy tube.
+        edits.push({ node: node, control: control, value: control.getValue() });
+        control.setValue(sides);
+        object.forceCacheUpdate(node);
+        mesh = object.getCachedGeom();
+        if (!mesh || !mesh.inherits("DzFacetMesh") || !mesh.getNumFacets()) {
+            throw new Error("DAZ could not generate polygon ribbons for " + node.getLabel() + ".");
+        }
+        return sides;
+    }
+    function restore(edits) {
+        while (edits.length) {
+            var edit = edits.pop();
+            edit.control.setValue(edit.value);
+            edit.node.getObject().forceCacheUpdate(edit.node);
+        }
+    }
+    return { prepare: prepare, restore: restore };
+})();

@@ -1,0 +1,47 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Register all suite tools under Scripts > Spin Tools without changing scene data.
+// Each tool's installer runs quietly; one summary is shown at the end.
+(function () {
+    var title = "Install Spin Tools menu";
+    var website = "https://www.spin256.com/tools";
+    var folder = String(getScriptFileName()).replace(/\\/g,"/").replace(/[^\/]*$/,"");
+    var installers = ["Spin-Drape-Tool/Install Drape Tool Menu.dsa",
+                      "Spin-Soft-Prop-Tool/Install Soft Prop Menu.dsa",
+                      "Spin-Prop-Split-Tool/Install Spin Prop Split Menu.dsa",
+                      "Spin-Soft-Body-Tool/Install Soft Body Menu.dsa",
+                      "Spin-Hair-Tool/Install Hair Tool Menu.dsa",
+                      "Spin-Frame-Zero-Tool/Install Frame Zero Menu.dsa",
+                      "Install Spin Tools Receiver Menu.dsa"];
+    var entries = ["Drape Tool...", "Soft Prop Tool...", "Split Selected Prop...", "Soft Body Tool...", "Hair Tool...",
+                   "Current Frame to Zero", "Receive Results..."];
+    var flag = new DzAppSettings("Spin256/Installer");
+    var failed = [];
+    try {
+        if (!folder) throw new Error("Run the saved Install Spin Tools Menu.dsa file.");
+        flag.setStringValue("Quiet", "1");
+        try {
+            for (var i=0;i<installers.length;i++) {
+                var script = new DzScript();
+                if (!script.loadFromFile(folder+installers[i])) failed.push(installers[i]+": could not be loaded");
+                else if (!script.execute()) failed.push(installers[i]+": "+script.errorMessage());
+            }
+        } finally {
+            flag.setStringValue("Quiet", "");
+        }
+        var installed = [];
+        for (var e=0;e<entries.length;e++) installed.push("    " + entries[e]);
+        var message = "Spin Tools are under Scripts > Spin Tools:\n" + installed.join("\n") +
+            "\n\nUse Receive Results... to bring a result into DAZ after closing its receive window." +
+            "\n\nGuides and updates: " + website;
+        if (failed.length) {
+            message = "Some Spin Tools menu entries could not be installed:\n" + failed.join("\n") + "\n\n" + message;
+            print(message);
+            MessageBox.warning(message, title, "OK", "");
+        } else {
+            print(message);
+            MessageBox.information(message, title, "OK");
+        }
+    } catch (error) {MessageBox.warning(error.message,title,"OK","");}
+})();

@@ -1,0 +1,195 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Import and verify a static prop prepared by prepare_daz_import.py.
+(function () {
+    var folder = String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var title = "Import Spin Prop Split selection";
+    var tolerance = 0.0001;
+    var path = FileDialog.doFileDialog(true, title, folder, "DAZ import manifest (*.json)");
+    if (!path) {
+        return;
+    }
+    path = path.replace(/\\/g, "/");
+    folder = path.substring(0, path.lastIndexOf("/") + 1);
+
+    function readJson(name) {
+        var file = new DzFile(name);
+        if (!file.open(DzFile.ReadOnly)) {
+            throw new Error("Cannot open " + name);
+        }
+        try {
+            return JSON.parse(file.read());
+        } finally {
+            file.close();
+        }
+    }
+
+    function distance(point, xyz) {
+        return Math.max(Math.abs(point.x - xyz[0]), Math.abs(point.y - xyz[1]),
+            Math.abs(point.z - xyz[2]));
+    }
+
+    function verifyVertices(mesh, vertices) {
+        if (!mesh || mesh.getNumVertices() !== vertices.length) {
+            throw new Error("Unexpected vertex count.");
+        }
+        var drift = 0;
+        for (var i = 0; i < vertices.length; i++) {
+            drift = Math.max(drift, distance(mesh.getVertex(i), vertices[i]));
+        }
+        if (!(drift <= tolerance)) {
+            throw new Error("Vertex coordinates differ by " + drift + " cm.");
+        }
+        return drift;
+    }
+
+    function faceKey(indices) {
+        return indices.slice().sort(function (a, b) { return a - b; }).join(",");
+    }
+
+    function verifyGroup(mesh, reference, selected, groupName) {
+        var group = mesh.findFaceGroup(groupName);
+        if (mesh.getNumFacets() !== reference.length || !group ||
+                group.count() !== selected.length) {
+            throw new Error("Unexpected polygon count or missing " + groupName + " group.");
+        }
+        var expected = {};
+        var wanted = {};
+        var i;
+        for (i = 0; i < selected.length; i++) {
+            wanted[selected[i]] = true;
+        }
+        for (i = 0; i < reference.length; i++) {
+            var key = faceKey(reference[i]);
+            if (key in expected) {
+                throw new Error("Reference contains ambiguous duplicate faces.");
+            }
+            expected[key] = !!wanted[i];
+        }
+        for (i = 0; i < mesh.getNumFacets(); i++) {
+            var face = mesh.getFacet(i);
+            var ids = [face.vertIdx1, face.vertIdx2, face.vertIdx3];
+            if (face.vertIdx4 >= 0) {
+                ids.push(face.vertIdx4);
+            }
+            var actualKey = faceKey(ids);
+            if (!(actualKey in expected) || expected[actualKey] !== (group.findIndex(i) >= 0)) {
+                throw new Error("Imported face or group membership differs at face " + i + ".");
+            }
+            delete expected[actualKey];
+        }
+    }
+
+    var previous = Scene.getNodeList();
+    var originalSelection = Scene.getPrimarySelection();
+    var importer = null;
+    var startedImport = false;
+    function importedNodes() {
+        var added = [];
+        for (var i = 0; i < Scene.getNumNodes(); i++) {
+            var node = Scene.getNode(i);
+            if (previous.indexOf(node) < 0) {
+                added.push(node);
+            }
+        }
+        return added;
+    }
+
+    try {
+        var selection = readJson(path);
+        if (selection.version !== 1 || !selection.vertices || !selection.faces ||
+                !selection.groups || typeof selection.obj !== "string" ||
+                !/^[^\\/:]+\.obj$/i.test(selection.obj)) {
+            throw new Error("Choose the -daz.json manifest made by prepare_daz_import.py.");
+        }
+        var reference = selection;
+        importer = App.getImportMgr().findImporterByClassName("DzObjImporter");
+        if (!importer) {
+            throw new Error("DAZ's OBJ importer is unavailable.");
+        }
+        var options = new DzFileIOSettings();
+        importer.getDefaultOptions(options);
+        options.setFloatValue("Scale", 1);
+        options.setStringValue("LatAxis", "X");
+        options.setStringValue("VertAxis", "Y");
+        options.setStringValue("DepthAxis", "Z");
+        options.setBoolValue("InvertLat", false);
+        options.setBoolValue("InvertVert", false);
+        options.setBoolValue("InvertDepth", false);
+        options.setBoolValue("IncludeG", true);
+        options.setBoolValue("IncludeVT", true);
+        options.setBoolValue("IncludeUsemtl", true);
+        options.setBoolValue("IncludeMtllib", false);
+        options.setIntValue("RunSilent", 1);
+        startedImport = true;
+        var result = importer.readFile(folder + selection.obj, options);
+        var nodes = importedNodes();
+        if (Number(result) !== 0 || nodes.length !== 1) {
+            var labels = nodes.map(function (node) { return node.getLabel(); });
+            throw new Error("Expected one imported prop. DAZ added " + nodes.length +
+                " node(s) [" + labels.join(", ") + "]. OBJ import status: " + result + ".");
+        }
+        var copy = nodes[0];
+        var object = copy.getObject();
+        var shape = object ? object.getCurrentShape() : null;
+        var mesh = shape ? shape.getGeometry() : null;
+        if (!mesh || !mesh.inherits("DzFacetMesh")) {
+            throw new Error("The imported prop has no polygon mesh.");
+        }
+        var before = object.getCachedGeom();
+        verifyVertices(before, reference.vertices);
+        if (mesh.getNumFacets() !== reference.faces.length) {
+            throw new Error("Unexpected polygon count.");
+        }
+        var groups = Object.keys(selection.groups);
+        for (var g = 0; g < groups.length; g++) {
+            verifyGroup(mesh, reference.faces, selection.groups[groups[g]], groups[g]);
+        }
+
+        var drift = 0;
+        var pivot = selection.pivot;
+        if (pivot !== null) {
+            if (!Array.isArray(pivot) || pivot.length !== 3 ||
+                    !pivot.every(function (value) { return typeof value === "number" && isFinite(value); })) {
+                throw new Error("Invalid pivot coordinates.");
+            }
+            var positions = [];
+            for (var i = 0; i < before.getNumVertices(); i++) {
+                var point = before.getVertex(i);
+                positions.push([point.x, point.y, point.z]);
+            }
+            copy.adjustOrigin(new DzVec3(pivot[0], pivot[1], pivot[2]));
+            object.forceCacheUpdate(copy);
+            drift = verifyVertices(object.getCachedGeom(), positions);
+            if (!(distance(copy.getWSPos(), pivot) <= tolerance)) {
+                throw new Error("The world-space pivot did not reach the requested point.");
+            }
+        }
+
+        Scene.setPrimarySelection(copy);
+        var message = "PASS: " + groups.length + " face group(s) verified.";
+        if (pivot !== null) {
+            message += " Pivot verified. Maximum mesh drift: " + drift + " cm.";
+        }
+        print(message);
+        MessageBox.information(message, title, "OK");
+    } catch (error) {
+        if (startedImport) {
+            var added = importedNodes();
+            for (var j = added.length - 1; j >= 0; j--) {
+                Scene.removeNode(added[j]);
+            }
+            if (originalSelection) {
+                Scene.setPrimarySelection(originalSelection);
+            }
+        }
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    } finally {
+        if (importer) {
+            importer.deleteLater();
+        }
+    }
+})();
+

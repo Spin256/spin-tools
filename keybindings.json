@@ -1,0 +1,54 @@
+{
+  "_note": "Spin Tools keyboard shortcuts. 'common' applies to every tool that uses shortcuts; a tool's own section adds its actions and can override a common key. Each action takes a key string (e.g. \"Space\", \"Ctrl+Return\"), a list of alternatives, or [] to disable it. Reopen the tool after editing. F1 (or ?) in any tool lists its keys.",
+  "common": {
+    "pause_resume": "Space",
+    "orbit_up": "W",
+    "orbit_down": "S",
+    "orbit_left": "A",
+    "orbit_right": "D",
+    "pan_up": "Up",
+    "pan_down": "Down",
+    "pan_left": "Left",
+    "pan_right": "Right",
+    "zoom_in": "PgUp",
+    "zoom_out": "PgDown",
+    "grow_selection": [
+      "+",
+      "="
+    ],
+    "shrink_selection": "-",
+    "freeze_selected": "F",
+    "freeze_unselected": "Shift+F",
+    "unfreeze_selected": "U",
+    "unfreeze_all": "Shift+U",
+    "clear_selection": "Ctrl+D",
+    "reset_view": "V",
+    "send_to_daz": "Ctrl+Return",
+    "cancel_interaction": "Esc",
+    "show_avatar": [],
+    "reset_simulation": [],
+    "run_simulation": []
+  },
+  "drape": {
+    "hold_frame": "H",
+    "grab_fabric": "G",
+    "paint_selection": "P",
+    "paint_add": "Shift+A",
+    "paint_remove": "Shift+D",
+    "show_props": [],
+    "edit_pins": [],
+    "edit_fasteners": [],
+    "pin_top": [],
+    "clear_pins": [],
+    "clear_fasteners": []
+  },
+  "hair": {
+    "pull_hair": "G",
+    "pick_strands": "P",
+    "ring_select": "R",
+    "toggle_xray": "X"
+  },
+  "soft_body": {},
+  "soft_prop": {},
+  "prop_split": {}
+}

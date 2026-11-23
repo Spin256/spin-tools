@@ -1,0 +1,11 @@
+{
+  "name": "Spin Soft Prop Tool",
+  "description": "Deform cushions, seats, and other soft props under static or animated contact.",
+  "dependencies": [
+    "numpy",
+    "qt",
+    "vtk",
+    "warp",
+    "ufbx"
+  ]
+}

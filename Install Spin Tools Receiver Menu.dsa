@@ -1,0 +1,49 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Register the shared Spin Tools receive window under Scripts > Spin Tools.
+(function () {
+    var title = "Install Spin Tools receive menu";
+    // Inside "Install Spin Tools Menu.dsa" the suite shows one summary instead.
+    var quiet = false;
+    try { quiet = new DzAppSettings("Spin256/Installer").getStringValue("Quiet", "") === "1"; } catch (e) {}
+    var folder = String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var filename = "Receive Spin Tools Results.dsa";
+    var label = "Receive Results...";
+    var description = "Receive results sent from any Spin Tools helper";
+    try {
+        if (!folder) throw new Error("Run the saved Install Spin Tools Receiver Menu.dsa file from the Spin Tools folder.");
+        var path = folder + filename;
+        if (!new DzFileInfo(path).exists()) throw new Error("Could not find " + path);
+        // Read the receiver on every click so future updates need no reinstall.
+        var launcher = "(function () {" +
+            "var file = new DzFile(" + JSON.stringify(path) + ");" +
+            "if (!file.open(DzFile.ReadOnly)) {" +
+            "MessageBox.warning('Cannot open the Spin Tools receive window script.', 'Spin Tools', 'OK', ''); return; }" +
+            "var code = file.read(); file.close();" +
+            "var script = new DzScript(); script.setCode(code);" +
+            "if (!script.execute()) { MessageBox.warning(script.errorMessage(), 'Spin Tools', 'OK', ''); }" +
+            "})();";
+        var manager = MainWindow.getActionMgr();
+        var menu = manager.getMenu().getSubMenu("&Scripts").findOrCreateSubMenu("Spin Tools");
+        var action = "";
+        for (var i = 0; i < manager.getNumCustomActions(); i++) {
+            if (manager.getCustomActionDesc(i) === description) {
+                manager.setCustomActionScript(i, launcher, false);
+                manager.setCustomActionText(i, label);
+                action = manager.getCustomActionName(i);
+                break;
+            }
+        }
+        if (!action) action = manager.addCustomAction(label, description, launcher, false, "", "");
+        if (!action) throw new Error("DAZ Studio could not register the Spin Tools receive window.");
+        var items = menu.getItemList();
+        for (var j = 0; j < items.length; j++) {
+            if (items[j].type == DzActionMenuItem.CustomAction && items[j].action == action) return;
+        }
+        menu.insertCustomAction(action, -1);
+    } catch (error) {
+        if (quiet) throw error;
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

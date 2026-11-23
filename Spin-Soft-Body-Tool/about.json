@@ -1,0 +1,11 @@
+{
+  "name": "Spin Soft Body Tool",
+  "description": "Paint soft regions for contact deformation, jiggle, and guided openings on static or animated meshes.",
+  "dependencies": [
+    "numpy",
+    "qt",
+    "vtk",
+    "warp",
+    "ufbx"
+  ]
+}

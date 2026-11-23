@@ -1,0 +1,120 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Import the latest completed revision for the current live Drape capture.
+// Run by the Spin Tools receive window (spinDrapeReceiveOnce = true); the
+// geometry import itself is Import Static Drape.dsa.
+(function () {
+    var title = "Spin Drape Tool - Receive Result";
+    var folder = typeof spinDrapeFolder === "string" ? spinDrapeFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var settings = new DzAppSettings("Spin256/Drape/" + App.getApplicationDataName());
+
+    function readText(path) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.ReadOnly)) throw new Error("Could not read " + path);
+        try { return file.read().replace(/^﻿/, ""); }
+        finally { file.close(); }
+    }
+
+    function nodeRecord(node) {
+        var object = node.getObject();
+        return { id: node.elementID, object: object ? object.elementID : null };
+    }
+
+    function readState() {
+        return JSON.parse(settings.getStringValue("LiveReturn", "") || "{}");
+    }
+
+    function saveState(state) {
+        if (!settings.setStringValue("LiveReturn", JSON.stringify(state))) {
+            throw new Error("DAZ could not save the Drape receive state.");
+        }
+    }
+
+    function latestRevision(state) {
+        var latest = state.session && state.session.replace(/\.json$/, ".latest");
+        if (!latest || !new DzFile(latest).exists()) return null;
+        var revision = readText(latest).replace(/\\/g, "/");
+        var prefix = state.session.replace(/\\/g, "/").replace(/\.json$/, "-return-");
+        if (revision.indexOf(prefix) !== 0 || !/^[\w-]+\/session\.json$/.test(revision.substring(prefix.length))) {
+            throw new Error("The result revision does not belong to this capture.");
+        }
+        return revision === state.received ? null : revision;
+    }
+
+    function hidePrevious(nodes) {
+        if (!nodes.length) return;
+        var edits = [];
+        beginUndo();
+        try {
+            for (var i = 0; i < nodes.length; i++) {
+                var control = nodes[i].getVisibilityControl();
+                control.beginEdit();
+                edits.push(control);
+                nodes[i].setVisible(false);
+                if (nodes[i].isVisible()) throw new Error("Could not hide the previous result.");
+            }
+            while (edits.length) edits.shift().finishEdit();
+            acceptUndo("Hide previous Drape result");
+        } catch (error) {
+            while (edits.length) edits.pop().cancelEdit();
+            cancelUndo();
+            throw error;
+        }
+    }
+
+    function importRevision(state, revision) {
+        var oldNodes = [];
+        var previous = state.nodes || [];
+        for (var i = 0; i < previous.length; i++) {
+            var node = Scene.findNodeByElementID(previous[i].id);
+            if (node && nodeRecord(node).object === previous[i].object && node.isVisible()) {
+                if (node.getVisibilityControl().isLocked()) {
+                    throw new Error("Unlock the previous Drape result's visibility before receiving a revision.");
+                }
+                oldNodes.push(node);
+            }
+        }
+        var before = {};
+        var existing = Scene.getNodeList();
+        for (var b = 0; b < existing.length; b++) before[existing[b].elementID] = true;
+        var script = new DzScript();
+        script.setCode("var spinDrapeFolder = " + JSON.stringify(folder) + ";\n" +
+            "var drapeReturnSessionPath = " + JSON.stringify(revision) + ";\n" +
+            readText(folder + "Import Static Drape.dsa"));
+        if (!script.execute()) throw new Error(script.errorMessage());
+        // The importer reports its own failures; a revision that added no node failed.
+        var records = [];
+        var after = Scene.getNodeList();
+        for (var a = 0; a < after.length; a++) {
+            if (!before[after[a].elementID]) records.push(nodeRecord(after[a]));
+        }
+        if (!records.length) throw new Error("The Drape result was not imported. See the DAZ log for details.");
+        saveState({ session: state.session, received: revision, nodes: records });
+        hidePrevious(oldNodes);
+    }
+
+    try {
+        var state = readState();
+        if (!state.session || !new DzFile(state.session).exists()) {
+            MessageBox.information("Open Spin Drape Tool to capture a scene first.", title, "OK");
+            return;
+        }
+        var revision = null;
+        try {
+            revision = latestRevision(state);
+            if (revision) importRevision(state, revision);
+        } catch (error) {
+            print(title + ": " + error.message);
+            var current = readState();
+            if (current.session === state.session && current.received !== revision) {
+                current.receiveError = { revision: revision, message: error.message };
+                saveState(current);
+            }
+        }
+    } catch (error) {
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

@@ -1,0 +1,4 @@
+# Tested UI/geometry versions; no Warp/GPU simulation dependency.
+numpy==2.2.6
+PySide6-Essentials==6.12.0
+vtk==9.7.2

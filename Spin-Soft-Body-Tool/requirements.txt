@@ -1,0 +1,6 @@
+# Tested core versions. Keep Warp pinned: the suite shares the tested Warp 1.9.1 runtime.
+numpy==2.2.6
+PySide6-Essentials==6.12.0
+vtk==9.7.2
+warp-lang==1.9.1
+ufbx==0.0.5

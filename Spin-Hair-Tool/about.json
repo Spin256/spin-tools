@@ -1,0 +1,11 @@
+{
+  "name": "Spin Hair Tool",
+  "description": "Shape and simulate mesh hair with painted supports and collision objects.",
+  "dependencies": [
+    "numpy",
+    "qt",
+    "vtk",
+    "warp",
+    "ufbx"
+  ]
+}

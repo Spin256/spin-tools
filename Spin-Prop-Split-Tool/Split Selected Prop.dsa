@@ -1,0 +1,276 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Export the selected static prop and open the selector. The Spin Tools receive window
+// imports the split through Receive Prop Split Result.dsa, hiding the original.
+(function () {
+    var title = "Spin Prop Split Tool";
+    var folder = typeof spinPropSplitFolder === "string" ? spinPropSplitFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    if (!folder) {
+        MessageBox.warning("Run the saved Split Selected Prop.dsa file or its Spin Tools menu entry.", title, "OK", "");
+        return;
+    }
+    var settings = {};
+    try {
+        var settingsFile = new DzFile(folder + "settings.json");
+        if (settingsFile.exists()) {
+            if (!settingsFile.open(DzFile.ReadOnly)) throw new Error("Could not open settings.json.");
+            try { settings = JSON.parse(settingsFile.read().replace(/^\uFEFF/, "")); }
+            finally { settingsFile.close(); }
+        }
+        if (!settings || typeof settings !== "object" || settings instanceof Array) {
+            throw new Error("settings.json must contain an object.");
+        }
+    } catch (error) { MessageBox.warning(error.message, title, "OK", ""); return; }
+
+    function resolveSetting(name, fallback) {
+        var path = typeof settings[name] === "undefined" ? fallback : settings[name];
+        if (typeof path !== "string" || !path.replace(/\s/g, "").length) {
+            throw new Error(name + " in settings.json must be a nonempty path.");
+        }
+        path = path.replace(/\\/g, "/");
+        return /^(?:[A-Za-z]:\/|\/)/.test(path) ? path : folder + path;
+    }
+
+    function sessionDirectory() {
+        var path = resolveSetting("session_folder", "temp");
+        var directory = new DzDir(path);
+        if (!directory.exists() && !directory.mkpath(path)) {
+            throw new Error("Could not create session folder: " + path);
+        }
+        return path.replace(/\/+$/, "") + "/";
+    }
+
+    var sessionFolder;
+    var python;
+    try {
+        sessionFolder = sessionDirectory();
+        python = resolveSetting("python_executable", ".venv/Scripts/pythonw.exe");
+        if (!new DzFileInfo(python).exists()) throw new Error("Run Install Spin Prop Split Tool.cmd first.");
+    } catch (error) { MessageBox.warning(error.message, title, "OK", ""); return; }
+    print("Spin Prop Split Tool: polygon-based material transfer active.");
+    var original = Scene.getPrimarySelection();
+    var rigged = original && original.inherits("DzSkeleton");
+
+    function supportedHierarchy(node) {
+        var children = node.getNodeChildren(true);
+        if (!rigged) {
+            return children.length === 0;
+        }
+        for (var i = 0; i < children.length; i++) {
+            if (!children[i].inherits("DzBone") || children[i].getObject()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Capture-resolution guard (as the other tools' capture scripts): DAZ can hand out
+    // its temporary base-resolution cache, so finalize at viewport quality before reading the mesh.
+    function evaluatedMesh(node) {
+        node.update(false);
+        node.finalize(false, true);
+        var evaluated = node.getObject();
+        return evaluated ? evaluated.getCachedGeom() : null;
+    }
+    var object = original ? original.getObject() : null;
+    var mesh = object ? evaluatedMesh(original) : null;
+    if (!mesh || !mesh.inherits("DzFacetMesh") || !supportedHierarchy(original) ||
+            Scene.getSelectedNodeList().length !== 1) {
+        MessageBox.warning("Select one mesh prop or figure with no attached props. " +
+            "For a rigged prop, select its root above the hip.", title, "OK", "");
+        return;
+    }
+
+    var suiteFolder = folder.replace(/[^\/]*\/$/, "");
+    var sharedReceiver = suiteFolder + "Receive Spin Tools Results.dsa";
+    if (!suiteFolder || suiteFolder === folder || !new DzFile(sharedReceiver).exists() ||
+            !new DzFile(folder + "Receive Prop Split Result.dsa").exists()) {
+        MessageBox.warning("Spin Prop Split Tool must run from its Spin Tools folder: the shared receive window " +
+            "(Receive Spin Tools Results.dsa) or Receive Prop Split Result.dsa is missing. Reinstall Spin Tools.",
+            title, "OK", "");
+        return;
+    }
+
+    var prefix = sessionFolder + ".bridge-" + new Date().getTime() + "-" +
+        Math.floor(Math.random() * 1000000);
+    var source = prefix + ".obj";
+    var result = prefix + ".json";
+    var sessionPath = prefix + "-session.json";
+    var pieces = [prefix + "-selected.obj", prefix + "-remainder.obj"];
+    var launched = false;
+
+    function writeText(path, text) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.WriteOnly | DzFile.Truncate)) throw new Error("Could not create " + path);
+        try {
+            if (file.writeUtf8(text) <= 0) throw new Error("Could not write " + path);
+        } finally {
+            file.close();
+        }
+    }
+
+    // The prop's OBJ is written here from its evaluated mesh, not with DAZ's OBJ exporter, which writes the
+    // whole scene when a nested prop is selected (SelectedRootsOnly/PrimaryRootOnly off).
+    // Cached geometry is evaluated in world space, including every ancestor transform, so a nested prop returns to
+    // where it is in the scene. Records: world-space positions, UVs, one usemtl per material group (its name, spaces
+    // replaced by "_" and made unique; the receive script maps imported surfaces back by polygon) and DAZ's own facets
+    // (triangles and quads) with their UVs, in DAZ's vertex order.
+    function surfaceTokens(geometry) {
+        var tokens = [], used = {};
+        for (var m = 0; m < geometry.getNumMaterialGroups(); m++) {
+            var base = String(geometry.getMaterialGroup(m).name).replace(/\s+/g, "_") || "surface";
+            var token = base;
+            for (var k = 2; used[token]; k++) token = base + "_" + k;
+            used[token] = true;
+            tokens.push(token);
+        }
+        return tokens;
+    }
+
+    // Each surface's base color and base color texture for the selector's View. Preview
+    // only: a missing value leaves that surface gray in the selector and never stops the capture.
+    function surfaceLooks(node, geometry) {
+        var shape = node.getObject().getCurrentShape();
+        var tokens = surfaceTokens(geometry), looks = [];
+        for (var m = 0; m < tokens.length; m++) {
+            var name = String(geometry.getMaterialGroup(m).name);
+            var look = { token: tokens[m], name: name, color: null, texture: null };
+            try {
+                var material = shape ? shape.findMaterial(name) : null;
+                if (material) {
+                    var color = typeof material.getDiffuseColor === "function" ? material.getDiffuseColor() : null;
+                    if (color) look.color = [color.red, color.green, color.blue];
+                    var map = typeof material.getColorMap === "function" ? material.getColorMap() : null;
+                    var file = map && typeof map.getFilename === "function" ? String(map.getFilename()) : "";
+                    if (file) look.texture = file;
+                }
+            } catch (error) {
+                print(title + ": no preview look for surface " + name + ": " + error.message);
+            }
+            looks.push(look);
+        }
+        return looks;
+    }
+
+    function meshObj(geometry, vertices) {
+        var lines = ["# Spin Prop Split capture"];
+        for (var i = 0; i < vertices.length; i++) {
+            lines.push("v " + vertices[i][0] + " " + vertices[i][1] + " " + vertices[i][2]);
+        }
+        var uvs = geometry.getUVs();
+        var uvCount = uvs ? uvs.getNumValues() : 0;
+        for (var u = 0; u < uvCount; u++) {
+            var uv = uvs.getPnt2Vec(u);
+            lines.push("vt " + uv.x + " " + uv.y);
+        }
+        var tokens = surfaceTokens(geometry);
+        var current = -1;
+        for (var f = 0; f < geometry.getNumFacets(); f++) {
+            var facet = geometry.getFacet(f);
+            var corners = [facet.vertIdx1, facet.vertIdx2, facet.vertIdx3];
+            var uvCorners = [facet.uvwIdx1, facet.uvwIdx2, facet.uvwIdx3];
+            if (facet.vertIdx4 >= 0) {
+                corners.push(facet.vertIdx4);
+                uvCorners.push(facet.uvwIdx4);
+            }
+            if (tokens[facet.materialIndex] === undefined) throw new Error("A prop polygon has no material group.");
+            if (facet.materialIndex !== current) {
+                current = facet.materialIndex;
+                lines.push("usemtl " + tokens[current]);
+            }
+            var withUV = uvCorners.every(function (index) { return index >= 0 && index < uvCount; });
+            lines.push("f " + corners.map(function (index, corner) {
+                return (index + 1) + (withUV ? "/" + (uvCorners[corner] + 1) : "");
+            }).join(" "));
+        }
+        return lines.join("\n") + "\n";
+    }
+
+    // Register the capture, start the selector detached and open the shared receive window.
+    function launchLive() {
+        var propSettings = new DzAppSettings("Spin256/PropSplit/" + App.getApplicationDataName());
+        var previousReturn = propSettings.getStringValue("LiveReturn", "");
+        var receiver = new DzAppSettings("Spin256/Receiver/" + App.getApplicationDataName());
+        var previousCaptures = receiver.getStringValue("Captures", "");
+        var data;
+        try { data = JSON.parse(previousCaptures || "{}"); }
+        catch (error) { data = {}; }
+        var captures = data && data.version === 1 && Array.isArray(data.captures) ? data.captures : [];
+        var kept = [];
+        for (var i = 0; i < captures.length; i++) {
+            if (captures[i] && captures[i].tool !== "prop-split") kept.push(captures[i]);
+        }
+        kept.push({ tool: "prop-split", title: "Spin Prop Split", session: sessionPath, folder: folder,
+            receive_script: "Receive Prop Split Result.dsa", folder_variable: "spinPropSplitFolder",
+            once_variable: "spinPropSplitReceiveOnce", settings: "Spin256/PropSplit/", state_key: "LiveReturn",
+            registered: new Date().getTime() });
+        try {
+            if (!propSettings.setStringValue("LiveReturn", JSON.stringify({ session: sessionPath })) ||
+                    !receiver.setStringValue("Captures", JSON.stringify({ version: 1, captures: kept }))) {
+                throw new Error("Could not register this split for the Spin Tools receive window.");
+            }
+            var process = new DzProcess([python, folder + "app/live_return.py",
+                "--bridge-source", source, "--bridge-result", result, "--bridge-session", sessionPath]);
+            process.workingDirectory = folder;
+            if (!process.start()) {
+                throw new Error("Could not launch the selector. Check the Python setup in the README.");
+            }
+            while (process.running) {
+                processEvents();
+                sleep(40);
+            }
+            if (!process.normalExit || Number(process.exitStatus) !== 0) {
+                throw new Error("The selector could not be started.");
+            }
+        } catch (error) {
+            propSettings.setStringValue("LiveReturn", previousReturn);
+            receiver.setStringValue("Captures", previousCaptures);
+            throw error;
+        }
+        launched = true;
+        App.postScriptEvent(false, sharedReceiver);
+    }
+
+    try {
+        var sourceState, sourceFacets;
+        function readSource() {
+            sourceState = {faces: mesh.getNumFacets(), vertices: []};
+            for (var v = 0; v < mesh.getNumVertices(); v++) {
+                var point = mesh.getVertex(v);
+                sourceState.vertices.push([point.x, point.y, point.z]);
+            }
+            // DAZ's own facets (triangles/quads) let the selector split n-gons exactly as DAZ does.
+            sourceFacets = [];
+            for (var fi = 0; fi < mesh.getNumFacets(); fi++) {
+                var facet = mesh.getFacet(fi);
+                var corners = [facet.vertIdx1, facet.vertIdx2, facet.vertIdx3];
+                if (facet.vertIdx4 >= 0) corners.push(facet.vertIdx4);
+                sourceFacets.push(corners);
+            }
+        }
+        readSource();
+        writeText(source, meshObj(mesh, sourceState.vertices));
+        // Everything the receive script needs to re-verify the untouched source.
+        writeText(sessionPath, JSON.stringify({ version: 1, source: source, result: result, pieces: pieces,
+            source_id: original.elementID, source_object_id: object.elementID, label: original.getLabel(),
+            rigged: !!rigged, source_state: sourceState, source_facets: sourceFacets,
+            surfaces: surfaceLooks(original, mesh) }));
+        launchLive();
+    } catch (error) {
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    } finally {
+        // After launch the selector owns the capture; it removes it if closed without a split.
+        if (!launched) {
+            var files = [source, result, prefix + ".tmp", sessionPath].concat(pieces);
+            for (var j = 0; j < files.length; j++) {
+                var file = new DzFile(files[j]);
+                if (file.exists()) {
+                    file.remove();
+                }
+            }
+        }
+    }
+})();

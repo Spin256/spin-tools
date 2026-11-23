@@ -1,0 +1,147 @@
+// Spin Tools — Originally developed by Spin256 (spin256.com/tools). Copyright (C) 2026 Spin256.
+// SPDX-License-Identifier: AGPL-3.0-only — see LICENSE and ADDITIONAL_TERMS.md.
+// The Spin256 name, logo and icon are not licensed for reuse; see ADDITIONAL_TERMS.md.
+// Import the latest completed revision for the current Soft Body capture.
+(function () {
+    var title = "Spin Soft Body Tool - Receive Result";
+    var folder = typeof spinSoftBodyFolder === "string" ? spinSoftBodyFolder :
+        String(getScriptFileName()).replace(/\\/g, "/").replace(/[^\/]*$/, "");
+    var settings = new DzAppSettings("Spin256/SoftBody/" + App.getApplicationDataName());
+
+    function readText(path) {
+        var file = new DzFile(path);
+        if (!file.open(DzFile.ReadOnly)) throw new Error("Could not read " + path);
+        try { return file.read().replace(/^\uFEFF/, ""); }
+        finally { file.close(); }
+    }
+
+    function nodeRecord(node) {
+        var object = node.getObject();
+        return { id: node.elementID, object: object ? object.elementID : null };
+    }
+
+    function hidePrevious(nodes) {
+        if (!nodes.length) return;
+        var edits = [];
+        beginUndo();
+        try {
+            for (var i = 0; i < nodes.length; i++) {
+                var control = nodes[i].getVisibilityControl();
+                control.beginEdit();
+                edits.push(control);
+                nodes[i].setVisible(false);
+                if (nodes[i].isVisible()) throw new Error("Could not hide the previous result.");
+            }
+            while (edits.length) edits.shift().finishEdit();
+            acceptUndo("Hide previous Soft Body result");
+        } catch (error) {
+            while (edits.length) edits.pop().cancelEdit();
+            cancelUndo();
+            throw error;
+        }
+    }
+
+    function readState() {
+        return JSON.parse(settings.getStringValue("LiveReturn", "") || "{}");
+    }
+
+    function latestRevision(state) {
+        var latest = state.session && state.session.replace(/\.json$/, ".latest");
+        if (!latest || !new DzFile(latest).exists()) return null;
+        var revision = readText(latest).replace(/\\/g, "/");
+        var prefix = state.session.replace(/\\/g, "/").replace(/\.json$/, "-return-");
+        if (revision.indexOf(prefix) !== 0 || !/^[\w-]+\/session\.json$/.test(revision.substring(prefix.length))) {
+            throw new Error("The result revision does not belong to this capture.");
+        }
+        return revision === state.received ? null : revision;
+    }
+
+    function importRevision(state, revision) {
+        var oldNodes = [];
+        var previous = state.nodes || [];
+        for (var i = 0; i < previous.length; i++) {
+            var node = Scene.findNodeByElementID(previous[i].id);
+            if (node && nodeRecord(node).object === previous[i].object && node.isVisible()) {
+                if (node.getVisibilityControl().isLocked()) {
+                    throw new Error("Unlock the previous Soft Body result's visibility before receiving a revision.");
+                }
+                oldNodes.push(node);
+            }
+        }
+        var script = new DzScript();
+        script.setCode("var spinSoftBodyFolder = " + JSON.stringify(folder) + ";\n" +
+            "var drapeReturnSessionPath = " + JSON.stringify(revision) + ";\n" +
+            readText(folder + "Import Soft Body.dsa"));
+        if (!script.execute()) throw new Error(script.errorMessage());
+
+        // The importer selects the returned nodes only after all validation succeeds.
+        var selected = Scene.getSelectedNodeList();
+        var records = [];
+        for (var j = 0; j < selected.length; j++) records.push(nodeRecord(selected[j]));
+        var receipt = { session: state.session, received: revision, nodes: records };
+        if (!settings.setStringValue("LiveReturn", JSON.stringify(receipt))) {
+            throw new Error("The result imported, but DAZ could not save its revision receipt.");
+        }
+        hidePrevious(oldNodes);
+    }
+
+    var receiveOnce = typeof spinSoftBodyReceiveOnce !== "undefined" && spinSoftBodyReceiveOnce;
+
+    function attemptReceive(state) {
+        var revision = null;
+        try {
+            revision = latestRevision(state);
+            if (!revision) return false;
+            importRevision(state, revision);
+        } catch (error) {
+            print(title + ": " + error.message);
+            var current = readState();
+            if (current.session === state.session && current.received !== revision) {
+                current.receiveError = { revision: revision, message: error.message };
+                if (!settings.setStringValue("LiveReturn", JSON.stringify(current))) throw error;
+            }
+        }
+        return true;
+    }
+
+    // Register this capture with the Spin Tools receive window, which runs this
+    // script once per result (spinSoftBodyReceiveOnce = true).
+    function openSharedReceiver(session) {
+        var suite = folder.replace(/[^\/]*\/$/, "");
+        var shared = suite + "Receive Spin Tools Results.dsa";
+        if (!suite || suite === folder || !new DzFile(shared).exists()) {
+            throw new Error("Spin Soft Body Tool must run from its Spin Tools folder: the shared receive window " +
+                "(Receive Spin Tools Results.dsa) is missing. Reinstall Spin Tools.");
+        }
+        var receiver = new DzAppSettings("Spin256/Receiver/" + App.getApplicationDataName());
+        var data;
+        try { data = JSON.parse(receiver.getStringValue("Captures", "") || "{}"); }
+        catch (error) { data = {}; }
+        var captures = data && data.version === 1 && Array.isArray(data.captures) ? data.captures : [];
+        var kept = [];
+        for (var i = 0; i < captures.length; i++) {
+            if (captures[i] && captures[i].tool !== "soft-body") kept.push(captures[i]);
+        }
+        kept.push({ tool: "soft-body", title: "Spin Soft Body", session: session, folder: folder,
+            receive_script: "Receive Soft Body Result.dsa", folder_variable: "spinSoftBodyFolder",
+            once_variable: "spinSoftBodyReceiveOnce", settings: "Spin256/SoftBody/", state_key: "LiveReturn",
+            registered: Date.now() });
+        if (!receiver.setStringValue("Captures", JSON.stringify({ version: 1, captures: kept }))) {
+            throw new Error("DAZ could not register this capture with the Spin Tools receive window.");
+        }
+        App.postScriptEvent(false, shared);
+    }
+
+    try {
+        var state = readState();
+        if (!state.session || !new DzFile(state.session).exists()) {
+            MessageBox.information("Open Spin Soft Body Tool to capture a scene first.", title, "OK");
+            return;
+        }
+        if (receiveOnce) attemptReceive(state);
+        else openSharedReceiver(state.session);
+    } catch (error) {
+        print(title + ": " + error.message);
+        MessageBox.warning(error.message, title, "OK", "");
+    }
+})();

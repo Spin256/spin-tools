@@ -1,0 +1,11 @@
+{
+  "name": "Spin Drape Tool",
+  "description": "Drape garments over static or animated collision objects, with painting, wind, water, and interactive adjustments.",
+  "dependencies": [
+    "numpy",
+    "qt",
+    "vtk",
+    "warp",
+    "ufbx"
+  ]
+}

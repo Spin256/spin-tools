@@ -7,6 +7,23 @@ another region of itself. The user creates the overlap; the tool resolves it in
 painted receiving regions while following a static pose or source animation. This is an artistic surface
 solver, not a muscle/bone or full volumetric tissue simulation.
 
+## Motion examples: read this first
+
+Soft Body may catch some people out. A painted area normally follows its DAZ animation, with
+contact and jiggle added on top. Once the area has a motion example, the simulation replaces the
+DAZ animation inside it, so the example poses never appear in the final animation.
+
+The first frame of the captured timeline is the starting reference. On other frames of the
+animation, pose the area at its extremes: for breasts, up, down, left and right. Paint just that
+area, for example the breasts, not neighboring parts that only move with the body's pose, such as
+the shoulders. Save it as a named region, choose **Bounce** under **DAZ motion examples**, enter
+the example frame numbers and click **Apply**.
+
+The movement stays close to the range the examples show; contact can still push it a little
+further. The edge fades into the unpainted skin over **Bounce edge blend** rings; raise it if the
+edge creases. **Stiffness**, **Damping** and **Movement inertia** in the **Jiggle** section set
+how the area swings, even with jiggle turned off.
+
 ## Open
 
 Setup is described in the [suite guide](../README.md). An NVIDIA CUDA GPU is required.
@@ -197,7 +214,7 @@ removes it. Regions with examples must not overlap.
 
 - **Bounce** uses frames that show the painted part pushed different ways. The
   solver blends between them as the body moves, so the tissue lags and settles
-  without moving further than the examples. **Bounce edge blend** sets how many
+  within about the range of the examples. **Bounce edge blend** sets how many
   rings of the painted area fade into the unpainted skin (8); raise it if the edge
   creases, lower it for a small area. Stiffness, Damping and Movement inertia in
   **Jiggle** set the swing, even with jiggle off.
